@@ -1,0 +1,40 @@
+name: MQM watch
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # каждый час, в :07 (UTC)
+  workflow_dispatch: {}    # кнопка ручного запуска
+
+permissions:
+  contents: write          # нужно, чтобы сохранять mqm_state.json
+
+concurrency:
+  group: mqm-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check result and notify
+        env:
+          GREEN_ID_INSTANCE: ${{ secrets.GREEN_ID_INSTANCE }}
+          GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
+          GREEN_CHAT_ID: ${{ secrets.GREEN_CHAT_ID }}
+          GREEN_API_URL: ${{ secrets.GREEN_API_URL }}
+        run: |
+          # пустой секрет GREEN_API_URL -> используем значение по умолчанию
+          [ -z "$GREEN_API_URL" ] && unset GREEN_API_URL
+          python3 mqm_watch.py
+
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain mqm_state.json)" ]; then
+            git config user.name "mqm-bot"
+            git config user.email "mqm-bot@users.noreply.github.com"
+            git add mqm_state.json
+            git commit -m "update state"
+            git push
+          fi
