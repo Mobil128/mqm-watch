@@ -66,7 +66,11 @@ def send(message):
     try:
         print("Green API:", urllib.request.urlopen(req, timeout=30).read().decode())
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Green API {e.code}: {e.read().decode('utf-8', 'replace')}")
+        err = e.read().decode("utf-8", "replace")
+        if e.code == 466:  # проверка, тот ли chatId, не раскрывая его
+            print(f"chatId: длина {len(CHAT)}, ascii={CHAT.isascii()}, "
+                  f"@g.us={CHAT.endswith('@g.us')}, в списке разрешённых={CHAT in err}")
+        raise RuntimeError(f"Green API {e.code}: {err}")
 
 
 def fmt(old, new):
