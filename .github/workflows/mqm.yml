@@ -2,7 +2,7 @@ name: MQM watch
 
 on:
   schedule:
-    - cron: "*/20 * * * *"   # каждые 20 минут (UTC)
+    - cron: "5,25,45 * * * *"   # каждые 20 минут, в :05/:25/:45 (не в :00 — там GitHub перегружен)
   workflow_dispatch:        # кнопка ручного запуска
     inputs:
       test:
