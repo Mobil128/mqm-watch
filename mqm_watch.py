@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -62,7 +63,10 @@ def send(message):
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    print("Green API:", urllib.request.urlopen(req, timeout=30).read().decode())
+    try:
+        print("Green API:", urllib.request.urlopen(req, timeout=30).read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Green API {e.code}: {e.read().decode('utf-8', 'replace')}")
 
 
 def fmt(old, new):
