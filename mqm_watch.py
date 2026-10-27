@@ -28,6 +28,8 @@ API = os.environ.get("GREEN_API_URL", "https://api.green-api.com").rstrip("/")
 ID = os.environ.get("GREEN_ID_INSTANCE", "").strip()
 TOKEN = os.environ.get("GREEN_API_TOKEN", "").strip()
 CHAT = os.environ.get("GREEN_CHAT_ID", "").strip()
+if CHAT and "@" not in CHAT:  # указан только номер группы
+    CHAT += "@g.us"
 
 SUBJECTS = ["İngilis dili", "Azərbaycan dili", "Riyaziyyat"]
 
@@ -67,9 +69,6 @@ def send(message):
         print("Green API:", urllib.request.urlopen(req, timeout=30).read().decode())
     except urllib.error.HTTPError as e:
         err = e.read().decode("utf-8", "replace")
-        if e.code == 466:  # проверка, тот ли chatId, не раскрывая его
-            print(f"chatId: длина {len(CHAT)}, ascii={CHAT.isascii()}, "
-                  f"@g.us={CHAT.endswith('@g.us')}, в списке разрешённых={CHAT in err}")
         raise RuntimeError(f"Green API {e.code}: {err}")
 
 
