@@ -25,9 +25,9 @@ URL = os.environ.get(
 )
 STATE = Path(os.environ.get("MQM_STATE", Path(__file__).with_name("mqm_state.json")))
 API = os.environ.get("GREEN_API_URL", "https://api.green-api.com").rstrip("/")
-ID = os.environ.get("GREEN_ID_INSTANCE", "")
-TOKEN = os.environ.get("GREEN_API_TOKEN", "")
-CHAT = os.environ.get("GREEN_CHAT_ID", "")
+ID = os.environ.get("GREEN_ID_INSTANCE", "").strip()
+TOKEN = os.environ.get("GREEN_API_TOKEN", "").strip()
+CHAT = os.environ.get("GREEN_CHAT_ID", "").strip()
 
 SUBJECTS = ["İngilis dili", "Azərbaycan dili", "Riyaziyyat"]
 
