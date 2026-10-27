@@ -74,10 +74,10 @@ def send(message):
 
 def fmt(old, new):
     lines = [
-        "📊 Asim Qaraxanov — результат обновлён",
-        f"Итог: {old['total']} → {new['total']} / {new['max']:g}"
+        "📊 Asim Qaraxanov — nəticə yeniləndi",
+        f"Yekun: {old['total']} → {new['total']} / {new['max']:g}"
         if old
-        else f"Итог: {new['total']} / {new['max']:g}",
+        else f"Yekun: {new['total']} / {new['max']:g}",
     ]
     for name, val in new["subjects"].items():
         prev = (old or {}).get("subjects", {}).get(name)
@@ -92,7 +92,7 @@ def main():
     new = parse(fetch_text())
 
     if os.environ.get("MQM_TEST") == "true":
-        send("✅ Тест: MQM watch работает\n" + fmt(None, new).split("\n", 1)[1])
+        send("✅ Test: MQM watch işləyir\n" + fmt(None, new).split("\n", 1)[1])
         return
 
     old = json.loads(STATE.read_text()) if STATE.exists() else None
