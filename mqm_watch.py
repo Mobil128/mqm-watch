@@ -8,6 +8,7 @@
   GREEN_CHAT_ID       - id группы, вида 1203630xxxxxxxx@g.us
   GREEN_API_URL       - (необязательно) хост инстанса, по умолчанию https://api.green-api.com
   MQM_URL             - (необязательно) ссылка на результат
+  MQM_TEST            - (необязательно) "true": отправить тестовое сообщение
 """
 import html
 import json
@@ -82,6 +83,11 @@ def fmt(old, new):
 
 def main():
     new = parse(fetch_text())
+
+    if os.environ.get("MQM_TEST") == "true":
+        send("✅ Тест: MQM watch работает\n" + fmt(None, new).split("\n", 1)[1])
+        return
+
     old = json.loads(STATE.read_text()) if STATE.exists() else None
 
     if old is None:

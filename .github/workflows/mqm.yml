@@ -3,7 +3,12 @@ name: MQM watch
 on:
   schedule:
     - cron: "7 * * * *"   # каждый час, в :07 (UTC)
-  workflow_dispatch: {}    # кнопка ручного запуска
+  workflow_dispatch:        # кнопка ручного запуска
+    inputs:
+      test:
+        description: "Отправить тестовое сообщение в группу"
+        type: boolean
+        default: false
 
 permissions:
   contents: write          # нужно, чтобы сохранять mqm_state.json
@@ -24,6 +29,7 @@ jobs:
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           GREEN_CHAT_ID: ${{ secrets.GREEN_CHAT_ID }}
           GREEN_API_URL: ${{ secrets.GREEN_API_URL }}
+          MQM_TEST: ${{ inputs.test }}
         run: |
           # пустой секрет GREEN_API_URL -> используем значение по умолчанию
           [ -z "$GREEN_API_URL" ] && unset GREEN_API_URL
