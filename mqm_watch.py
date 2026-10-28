@@ -9,6 +9,7 @@
   GREEN_API_URL       - (необязательно) хост инстанса, по умолчанию https://api.green-api.com
   MQM_URL             - (необязательно) ссылка на результат
   MQM_TEST            - (необязательно) "true": отправить тестовое сообщение
+  MQM_DUMP            - (необязательно) "true": только вывести текст страницы и что нашлось
 """
 import html
 import json
@@ -33,6 +34,13 @@ if CHAT and "@" not in CHAT:  # указан только номер групп�
 
 SUBJECTS = ["İngilis dili", "Azərbaycan dili", "Riyaziyyat"]
 
+# Подписи счётчиков на странице (внутри блока каждого предмета)
+COUNTERS = {
+    "correct": r"Doğru cavabların sayı:\s*(\d+)",
+    "wrong": r"Yanlış cavabların sayı:\s*(\d+)",
+    "unverified": r"Qiymətləndirilməyib:\s*(\d+)",  # открытые вопросы на проверке
+}
+
 
 def fetch_text():
     req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
@@ -47,13 +55,34 @@ def parse(text):
     if not m:
         raise RuntimeError("Не нашёл 'Yekun nəticə' на странице (формат изменился?)")
     data = {"total": float(m.group(1)), "max": float(m.group(2)), "subjects": {}}
+
+    # начало блока каждого предмета -> блок идёт до начала следующего
+    starts = []
     for name in SUBJECTS:
-        s = re.search(
-            re.escape(name) + r"\s*\(Maksimum:\s*\d+\).*?Nəticə:\s*([\d.]+)", text
-        )
-        if s:
-            data["subjects"][name] = float(s.group(1))
+        h = re.search(re.escape(name) + r"\s*\(Maksimum:\s*\d+\)", text)
+        if h:
+            starts.append((h.start(), name))
+    starts.sort()
+    for i, (pos, name) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(text)
+        block = text[pos:end]
+        s = re.search(r"Nəticə:\s*([\d.]+)", block)
+        if not s:
+            continue
+        subj = {"score": float(s.group(1))}
+        subj.update(parse_counters(block))
+        data["subjects"][name] = subj
     return data
+
+
+def parse_counters(block):
+    """Берёт счётчики из блока предмета. Что не нашлось — пропускает."""
+    found = {}
+    for key, pat in COUNTERS.items():
+        m = re.search(pat, block)
+        if m:
+            found[key] = int(m.group(1))
+    return found
 
 
 def send(message):
@@ -72,6 +101,15 @@ def send(message):
         raise RuntimeError(f"Green API {e.code}: {err}")
 
 
+def norm(subjects):
+    """Старый формат состояния (число) -> новый (словарь)."""
+    return {k: v if isinstance(v, dict) else {"score": v} for k, v in (subjects or {}).items()}
+
+
+def chg(prev, cur):
+    return f"{prev}→{cur}" if prev is not None and prev != cur else f"{cur}"
+
+
 def fmt(old, new):
     lines = [
         "📊 Asim Qaraxanov — nəticə yeniləndi",
@@ -79,17 +117,29 @@ def fmt(old, new):
         if old
         else f"Yekun: {new['total']} / {new['max']:g}",
     ]
-    for name, val in new["subjects"].items():
-        prev = (old or {}).get("subjects", {}).get(name)
-        if prev is not None and prev != val:
-            lines.append(f"• {name}: {prev} → {val}")
-        else:
-            lines.append(f"• {name}: {val}")
+    olds = norm((old or {}).get("subjects"))
+    for name, cur in new["subjects"].items():
+        prev = olds.get(name, {})
+        score = chg(prev.get("score"), cur["score"]).replace("→", " → ")
+        line = f"• {name}: {score}"
+        parts = [
+            f"{icon} {chg(prev.get(key), cur[key])}"
+            for key, icon in (("correct", "✅"), ("wrong", "❌"), ("unverified", "⏳"))
+            if key in cur
+        ]
+        if parts:
+            line += " (" + " | ".join(parts) + ")"
+        lines.append(line)
     return "\n".join(lines)
 
 
 def main():
-    new = parse(fetch_text())
+    text = fetch_text()
+    if os.environ.get("MQM_DUMP") == "true":
+        print(text)
+        print("\nНАЙДЕНО:", parse(text))
+        return
+    new = parse(text)
 
     if os.environ.get("MQM_TEST") == "true":
         send("✅ Test: MQM watch işləyir\n" + fmt(None, new).split("\n", 1)[1])
@@ -102,7 +152,7 @@ def main():
         print("Первый запуск, сохранил базовое значение:", new)
         return
 
-    if new["total"] != old["total"] or new["subjects"] != old["subjects"]:
+    if new["total"] != old["total"] or new["subjects"] != norm(old["subjects"]):
         send(fmt(old, new))  # состояние сохраняем только после успешной отправки
         STATE.write_text(json.dumps(new, ensure_ascii=False))
     else:
