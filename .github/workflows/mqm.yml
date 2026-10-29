@@ -2,7 +2,7 @@ name: MQM watch
 
 on:
   schedule:
-    - cron: "6,25,45 * * * *"   # каждые 20 минут, в :05/:25/:45 (не в :00 — там GitHub перегружен)
+    - cron: "6,25,45 * * * *"   # каждые 20 минут, в :06/:25/:45 (не в :00 — там GitHub перегружен)
   workflow_dispatch:        # кнопка ручного запуска
     inputs:
       test:
@@ -41,6 +41,7 @@ jobs:
           python3 mqm_watch.py
 
       - name: Save state
+        if: always()   # сохранять состояние, даже если предыдущий шаг упал (иначе прогноз уйдёт повторно)
         run: |
           if [ -n "$(git status --porcelain mqm_state.json mqm_weather.json)" ]; then
             git config user.name "mqm-bot"
