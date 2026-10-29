@@ -10,6 +10,12 @@
   MQM_URL             - (необязательно) ссылка на результат
   MQM_TEST            - (необязательно) "true": отправить тестовое сообщение
   MQM_DUMP            - (необязательно) "true": только вывести текст страницы и что нашлось
+
+Прогноз погоды (раз в сутки, Open-Meteo, без ключа), всё необязательно:
+  WEATHER_PLACE       - название в сообщении, по умолчанию Pirşağı
+  WEATHER_LAT/LON     - координаты, по умолчанию 40.49 / 50.01 (Pirşağı, Баку)
+  WEATHER_SEND_HOUR   - во сколько (по Баку) слать, по умолчанию 7
+  WEATHER_HOURS       - сколько часов вперёд показывать (с текущего часа), по умолчанию 24
 """
 import html
 import json
@@ -17,7 +23,9 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 URL = os.environ.get(
@@ -82,6 +90,9 @@ def parse_counters(block):
         m = re.search(pat, block)
         if m:
             found[key] = int(m.group(1))
+    # когда непроверенных не осталось, сайт убирает эту строку совсем
+    if "correct" in found and "wrong" in found:
+        found.setdefault("unverified", 0)
     return found
 
 
@@ -133,7 +144,99 @@ def fmt(old, new):
     return "\n".join(lines)
 
 
-def main():
+# ---------------- Прогноз погоды ----------------
+BAKU = timezone(timedelta(hours=4))  # Азербайджан без перехода на летнее время
+W_STATE = Path(os.environ.get("WEATHER_STATE", Path(__file__).with_name("mqm_weather.json")))
+W_PLACE = os.environ.get("WEATHER_PLACE", "Pirşağı")
+W_LAT = os.environ.get("WEATHER_LAT", "40.49")
+W_LON = os.environ.get("WEATHER_LON", "50.01")
+W_SEND = int(os.environ.get("WEATHER_SEND_HOUR", "7"))
+W_HOURS = int(os.environ.get("WEATHER_HOURS", "24"))
+
+WEEKDAYS = ["Bazar ertəsi", "Çərşənbə axşamı", "Çərşənbə", "Cümə axşamı", "Cümə", "Şənbə", "Bazar"]
+# откуда дует ветер (метеорологическая договорённость: «şimal küləyi» = с севера)
+DIRS = ["şimal", "şimal-şərq", "şərq", "cənub-şərq", "cənub", "cənub-qərb", "qərb", "şimal-qərb"]
+STRONG_GUST = 50  # км/ч: от этого значения ставим ⚠️
+
+
+def fetch_weather(start_day, end_day):
+    qs = urllib.parse.urlencode({
+        "latitude": W_LAT,
+        "longitude": W_LON,
+        "hourly": "precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m",
+        "wind_speed_unit": "kmh",
+        "timezone": "Asia/Baku",
+        "start_date": start_day,
+        "end_date": end_day,
+    })
+    req = urllib.request.Request(
+        "https://api.open-meteo.com/v1/forecast?" + qs, headers={"User-Agent": "Mozilla/5.0"}
+    )
+    return json.loads(urllib.request.urlopen(req, timeout=30).read().decode())["hourly"]
+
+
+def fmt_weather(h, now):
+    start = now.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    end = start + timedelta(hours=W_HOURS)
+    rows = []
+    for i, t in enumerate(h["time"]):
+        dt = datetime.fromisoformat(t)
+        if not (start <= dt < end):
+            continue
+        rows.append({
+            "dt": dt,
+            "rain": h["precipitation"][i] or 0.0,
+            "prob": h["precipitation_probability"][i],
+            "wind": h["wind_speed_10m"][i] or 0.0,
+            "gust": h["wind_gusts_10m"][i] or 0.0,
+            "dir": DIRS[round((h["wind_direction_10m"][i] or 0) / 45) % 8],
+        })
+    if not rows:
+        raise RuntimeError("В ответе погоды нет нужных часов")
+
+    total = sum(r["rain"] for r in rows)
+    peak = max(rows, key=lambda r: r["gust"])
+    last = rows[-1]["dt"]
+    lines = [
+        f"🌦 {W_PLACE} — hava proqnozu",
+        f"{WEEKDAYS[now.weekday()]}, {now:%d.%m.%Y}, {rows[0]['dt']:%H:%M} → {last:%d.%m %H:%M}",
+        "",
+        f"🌧 Yağış: {total:.1f} mm" if total >= 0.1 else "☀️ Yağış gözlənilmir",
+        f"💨 Ən güclü külək: {peak['gust']:.0f} km/saat, {peak['dt']:%d.%m} saat {peak['dt']:%H:%M}",
+        "",
+    ]
+    day = rows[0]["dt"].date()
+    for r in rows:
+        if r["dt"].date() != day:  # перешли за полночь
+            day = r["dt"].date()
+            lines.append(f"— {day:%d.%m} —")
+        rain = (
+            f"🌧 {r['rain']:.1f} mm ({r['prob']}%)"
+            if r["rain"] >= 0.1
+            else (f"yağış yox ({r['prob']}%)" if r["prob"] else "yağış yox")
+        )
+        warn = " ⚠️" if r["gust"] >= STRONG_GUST else ""
+        lines.append(
+            f"{r['dt']:%H:%M} · {rain} · 💨 {r['wind']:.0f} ({r['gust']:.0f}) km/saat, {r['dir']}{warn}"
+        )
+    lines += ["", "Mötərizədə: yağış ehtimalı (%) və ani külək (km/saat)"]
+    return "\n".join(lines)
+
+
+def daily_weather(force=False):
+    """Раз в сутки после WEATHER_SEND_HOUR (по Баку). force=True — для теста, без записи в state."""
+    now = datetime.now(BAKU)
+    today = now.strftime("%Y-%m-%d")
+    last = json.loads(W_STATE.read_text()).get("date") if W_STATE.exists() else None
+    if not force and (now.hour < W_SEND or last == today):
+        return
+    tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    send(fmt_weather(fetch_weather(today, tomorrow), now))
+    if not force:
+        W_STATE.write_text(json.dumps({"date": today}))
+
+
+def check_results():
     text = fetch_text()
     if os.environ.get("MQM_DUMP") == "true":
         print(text)
@@ -159,9 +262,21 @@ def main():
         print("Без изменений:", new["total"])
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("ОШИБКА:", e, file=sys.stderr)
+def main():
+    if os.environ.get("MQM_DUMP") == "true":
+        check_results()
+        return
+    failed = False
+    # баллы и погода независимы: сбой одного не мешает другому
+    for step in (check_results, lambda: daily_weather(os.environ.get("MQM_TEST") == "true")):
+        try:
+            step()
+        except Exception as e:
+            print("ОШИБКА:", e, file=sys.stderr)
+            failed = True
+    if failed:
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
