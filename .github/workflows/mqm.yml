@@ -9,6 +9,10 @@ on:
         description: "Отправить тестовое сообщение в группу"
         type: boolean
         default: false
+      clean:
+        description: "Удалить старые сообщения бота сейчас (без прогноза)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write          # нужно, чтобы сохранять mqm_state.json и mqm_weather.json
@@ -30,6 +34,7 @@ jobs:
           GREEN_CHAT_ID: ${{ secrets.GREEN_CHAT_ID }}
           GREEN_API_URL: ${{ secrets.GREEN_API_URL }}
           MQM_TEST: ${{ inputs.test }}
+          MQM_CLEAN: ${{ inputs.clean }}
         run: |
           # пустой секрет GREEN_API_URL -> используем значение по умолчанию
           [ -z "$GREEN_API_URL" ] && unset GREEN_API_URL
