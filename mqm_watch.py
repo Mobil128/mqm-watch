@@ -15,6 +15,11 @@
   WEATHER_PLACE       - название в сообщении, по умолчанию Pirşağı
   WEATHER_LAT/LON     - координаты, по умолчанию 40.49 / 50.01 (Pirşağı, Баку)
   WEATHER_SEND_HOUR   - во сколько (по Баку) слать, по умолчанию 7
+  MQM_CLEAN           - (необязательно) "true": удалить старые сообщения бота сейчас (без погоды)
+
+Уборка: перед утренним прогнозом бот удаляет у всех свои сообщения старше сегодняшнего дня.
+Если сегодня сообщений с баллами не было — последнее вчерашнее с баллами остаётся.
+
   WEATHER_HOURS       - сколько часов вперёд показывать (с текущего часа), по умолчанию 24
 """
 import html
@@ -22,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -144,6 +150,72 @@ def fmt(old, new):
     return "\n".join(lines)
 
 
+# ---------------- Уборка старых сообщений бота ----------------
+# Трогаем ТОЛЬКО свои исходящие сообщения, начинающиеся с этих значков.
+# Любые другие сообщения с этого же номера (написанные вручную) не затрагиваются.
+SCORE_PREFIX = "📊"
+BOT_PREFIXES = (SCORE_PREFIX, "🌦", "✅ Test")
+CLEAN_COUNT = int(os.environ.get("CLEAN_HISTORY_COUNT", "200"))
+
+
+def api_call(method, payload):
+    req = urllib.request.Request(
+        f"{API}/waInstance{ID}/{method}/{TOKEN}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        raw = urllib.request.urlopen(req, timeout=60).read().decode()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Green API {method} {e.code}: {e.read().decode('utf-8', 'replace')}")
+    return json.loads(raw) if raw else None
+
+
+def cleanup_old(dry=False):
+    """Удаляет у всех сообщения бота старше сегодняшних 00:00 (Баку).
+    Если сегодня не было сообщения с баллами — оставляет последнее более раннее."""
+    if not (ID and TOKEN and CHAT):
+        raise RuntimeError("Не заданы GREEN_ID_INSTANCE / GREEN_API_TOKEN / GREEN_CHAT_ID")
+    cutoff = datetime.now(BAKU).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    history = api_call("getChatHistory", {"chatId": CHAT, "count": CLEAN_COUNT}) or []
+
+    mine = []
+    for m in history:
+        text = m.get("textMessage")
+        if m.get("type") == "outgoing" and isinstance(text, str) and text.startswith(BOT_PREFIXES):
+            mine.append(m)
+    mine.sort(key=lambda m: m.get("timestamp", 0))
+
+    old = [m for m in mine if m.get("timestamp", 0) < cutoff]
+    score_today = any(
+        m["textMessage"].startswith(SCORE_PREFIX) and m.get("timestamp", 0) >= cutoff for m in mine
+    )
+    keep = None
+    if not score_today:
+        olds_scores = [m for m in old if m["textMessage"].startswith(SCORE_PREFIX)]
+        keep = olds_scores[-1] if olds_scores else None
+    todo = [m for m in old if m is not keep]
+
+    print(f"История: {len(history)} сообщений, моих: {len(mine)}, к удалению: {len(todo)}"
+          + (f", оставляю: {keep['idMessage']}" if keep else ""))
+    failed = 0
+    for m in todo:
+        when = datetime.fromtimestamp(m["timestamp"], BAKU).strftime("%d.%m %H:%M")
+        first = m["textMessage"].split("\n")[0][:40]
+        if dry:
+            print(f"  [пробный режим] удалил бы {when} «{first}»")
+            continue
+        try:
+            api_call("deleteMessage", {"chatId": CHAT, "idMessage": m["idMessage"], "onlySenderDelete": False})
+            print(f"  удалено {when} «{first}»")
+        except Exception as e:  # например, слишком старое: WhatsApp не даёт удалить у всех
+            failed += 1
+            print(f"  не удалось {when} «{first}»: {e}", file=sys.stderr)
+        time.sleep(1)
+    if failed:
+        raise RuntimeError(f"Не удалось удалить {failed} сообщ.")
+
+
 # ---------------- Прогноз погоды ----------------
 BAKU = timezone(timedelta(hours=4))  # Азербайджан без перехода на летнее время
 W_STATE = Path(os.environ.get("WEATHER_STATE", Path(__file__).with_name("mqm_weather.json")))
@@ -224,16 +296,25 @@ def fmt_weather(h, now):
 
 
 def daily_weather(force=False):
-    """Раз в сутки после WEATHER_SEND_HOUR (по Баку). force=True — для теста, без записи в state."""
+    """Раз в сутки после WEATHER_SEND_HOUR (по Баку): уборка старых сообщений, затем прогноз.
+    force=True — тест: уборка в пробном режиме (ничего не удаляет), состояние не пишется."""
     now = datetime.now(BAKU)
     today = now.strftime("%Y-%m-%d")
     last = json.loads(W_STATE.read_text()).get("date") if W_STATE.exists() else None
     if not force and (now.hour < W_SEND or last == today):
         return
+    clean_error = None
+    try:
+        cleanup_old(dry=force)
+    except Exception as e:  # сбой уборки не должен лишать прогноза
+        clean_error = e
+        print("ОШИБКА уборки:", e, file=sys.stderr)
     tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
     send(fmt_weather(fetch_weather(today, tomorrow), now))
     if not force:
         W_STATE.write_text(json.dumps({"date": today}))
+    if clean_error:
+        raise clean_error
 
 
 def check_results():
@@ -265,6 +346,9 @@ def check_results():
 def main():
     if os.environ.get("MQM_DUMP") == "true":
         check_results()
+        return
+    if os.environ.get("MQM_CLEAN") == "true":
+        cleanup_old(dry=False)
         return
     failed = False
     # баллы и погода независимы: сбой одного не мешает другому
