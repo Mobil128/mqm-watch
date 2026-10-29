@@ -11,7 +11,7 @@ on:
         default: false
 
 permissions:
-  contents: write          # нужно, чтобы сохранять mqm_state.json
+  contents: write          # нужно, чтобы сохранять mqm_state.json и mqm_weather.json
 
 concurrency:
   group: mqm-watch
@@ -37,10 +37,10 @@ jobs:
 
       - name: Save state
         run: |
-          if [ -n "$(git status --porcelain mqm_state.json)" ]; then
+          if [ -n "$(git status --porcelain mqm_state.json mqm_weather.json)" ]; then
             git config user.name "mqm-bot"
             git config user.email "mqm-bot@users.noreply.github.com"
-            git add mqm_state.json
+            git add mqm_state.json mqm_weather.json 2>/dev/null || git add mqm_state.json
             git commit -m "update state"
             git push
           fi
