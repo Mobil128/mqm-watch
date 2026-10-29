@@ -198,7 +198,7 @@ def cleanup_old(dry=False):
 
     print(f"История: {len(history)} сообщений, моих: {len(mine)}, к удалению: {len(todo)}"
           + (f", оставляю: {keep['idMessage']}" if keep else ""))
-    failed = 0
+    failed = deleted = gone = 0
     for m in todo:
         when = datetime.fromtimestamp(m["timestamp"], BAKU).strftime("%d.%m %H:%M")
         first = m["textMessage"].split("\n")[0][:40]
@@ -207,11 +207,17 @@ def cleanup_old(dry=False):
             continue
         try:
             api_call("deleteMessage", {"chatId": CHAT, "idMessage": m["idMessage"], "onlySenderDelete": False})
+            deleted += 1
             print(f"  удалено {when} «{first}»")
-        except Exception as e:  # например, слишком старое: WhatsApp не даёт удалить у всех
-            failed += 1
+        except Exception as e:
+            if "already was deleted" in str(e):
+                gone += 1  # в истории ещё числится, но уже удалено — это нормально
+                continue
+            failed += 1  # например, слишком старое: WhatsApp не даёт удалить у всех
             print(f"  не удалось {when} «{first}»: {e}", file=sys.stderr)
         time.sleep(1)
+    if not dry:
+        print(f"Готово: удалено {deleted}, уже было удалено {gone}, не удалось {failed}")
     if failed:
         raise RuntimeError(f"Не удалось удалить {failed} сообщ.")
 
