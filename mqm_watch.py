@@ -8,19 +8,20 @@
   GREEN_CHAT_ID       - id группы, вида 1203630xxxxxxxx@g.us
   GREEN_API_URL       - (необязательно) хост инстанса, по умолчанию https://api.green-api.com
   MQM_URL             - (необязательно) ссылка на результат
+  MQM_CHECK_EXAM      - (необязательно) "true"/"false": проверять результаты экзамена, по умолчанию true
+  MQM_CHECK_WEATHER   - (необязательно) "true"/"false": отправлять прогноз погоды, по умолчанию true
   MQM_TEST            - (необязательно) "true": отправить тестовое сообщение
   MQM_DUMP            - (необязательно) "true": только вывести текст страницы и что нашлось
+  MQM_CLEAN           - (необязательно) "true": удалить старые сообщения бота сейчас (без прогноза)
 
 Прогноз погоды (раз в сутки, Open-Meteo, без ключа), всё необязательно:
   WEATHER_PLACE       - название в сообщении, по умолчанию Pirşağı
   WEATHER_LAT/LON     - координаты, по умолчанию 40.49 / 50.01 (Pirşağı, Баку)
   WEATHER_SEND_HOUR   - во сколько (по Баку) слать, по умолчанию 7
-  MQM_CLEAN           - (необязательно) "true": удалить старые сообщения бота сейчас (без погоды)
+  WEATHER_HOURS       - сколько часов вперёд показывать (с текущего часа), по умолчанию 24
 
 Уборка: перед утренним прогнозом бот удаляет у всех свои сообщения старше сегодняшнего дня.
 Если сегодня сообщений с баллами не было — последнее вчерашнее с баллами остаётся.
-
-  WEATHER_HOURS       - сколько часов вперёд показывать (с текущего часа), по умолчанию 24
 """
 import html
 import json
@@ -357,8 +358,15 @@ def main():
         cleanup_old(dry=False)
         return
     failed = False
+    check_exam = os.environ.get("MQM_CHECK_EXAM", "true").lower() == "true"
+    check_weather = os.environ.get("MQM_CHECK_WEATHER", "true").lower() == "true"
     # баллы и погода независимы: сбой одного не мешает другому
-    for step in (check_results, lambda: daily_weather(os.environ.get("MQM_TEST") == "true")):
+    steps = []
+    if check_exam:
+        steps.append(check_results)
+    if check_weather:
+        steps.append(lambda: daily_weather(os.environ.get("MQM_TEST") == "true"))
+    for step in steps:
         try:
             step()
         except Exception as e:
