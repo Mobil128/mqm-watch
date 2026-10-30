@@ -8,4 +8,7 @@ crons = ["* * * * *"]
 
 [[kv_namespaces]]
 binding = "MQM_KV"
-id = "ВСТАВЬТЕ_ID_KV_NAMESPACE"
+id = "3876d11e0fd14259ab6aa15d6b5b3b69"
+
+[observability]
+enabled = true
