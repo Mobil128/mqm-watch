@@ -1,9 +1,7 @@
 name: MQM watch
 
 on:
-  schedule:
-    - cron: "6,25,45 * * * *"   # каждые 20 минут, в :06/:26/:46 (не в :00 — там GitHub перегружен)
-  workflow_dispatch:        # кнопка ручного запуска
+  workflow_dispatch:        # запуск только вручную через cron-job.org или через GitHub UI
     inputs:
       test:
         description: "Отправить тестовое сообщение в группу"
