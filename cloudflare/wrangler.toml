@@ -1,0 +1,11 @@
+name = "mqm-watch"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# время в UTC; минуты совпадают с Баку
+[triggers]
+crons = ["6,25,45 * * * *"]
+
+[[kv_namespaces]]
+binding = "MQM_KV"
+id = "ВСТАВЬТЕ_ID_KV_NAMESPACE"
