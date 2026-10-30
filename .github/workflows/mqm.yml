@@ -3,6 +3,14 @@ name: MQM watch
 on:
   workflow_dispatch:        # запуск только вручную через cron-job.org или через GitHub UI
     inputs:
+      check_exam:
+        description: "Проверять результаты экзамена"
+        type: boolean
+        default: true
+      check_weather:
+        description: "Проверять погоду"
+        type: boolean
+        default: true
       test:
         description: "Отправить тестовое сообщение в группу"
         type: boolean
@@ -31,6 +39,8 @@ jobs:
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           GREEN_CHAT_ID: ${{ secrets.GREEN_CHAT_ID }}
           GREEN_API_URL: ${{ secrets.GREEN_API_URL }}
+          MQM_CHECK_EXAM: ${{ inputs.check_exam }}
+          MQM_CHECK_WEATHER: ${{ inputs.check_weather }}
           MQM_TEST: ${{ inputs.test }}
           MQM_CLEAN: ${{ inputs.clean }}
         run: |
