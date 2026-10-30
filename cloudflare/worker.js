@@ -8,6 +8,10 @@
 //   GREEN_CHAT_ID       - id группы, можно без @g.us (secret)
 //   RUN_KEY             - пароль для страницы управления и ссылки /run (secret)
 //   GREEN_API_URL       - (необязательно) хост инстанса, по умолчанию https://api.green-api.com
+//   WEBHOOK_SECRET      - секретная часть адреса /webhook/<секрет> для уведомлений Green API (secret)
+//   FIREBASE_DB_URL     - адрес Realtime Database, https://<проект>-default-rtdb.<регион>.firebasedatabase.app (secret)
+//   FIREBASE_SECRET     - Database secret (secret) — или вместо него:
+//   FIREBASE_SERVICE_ACCOUNT - JSON ключа сервисного аккаунта целиком (secret)
 //
 // Cron Trigger в Cloudflare: "* * * * *" — воркер просыпается каждую минуту,
 // а как часто проверять экзамен, решает настройка на странице.
@@ -443,6 +447,115 @@ async function run(env, s, opts, source) {
   return { ok, log };
 }
 
+// ---------------- Firebase Realtime Database: сбор сообщений ----------------
+// Секреты: FIREBASE_DB_URL и один из способов входа —
+//   FIREBASE_SECRET (Database secret) или FIREBASE_SERVICE_ACCOUNT (JSON сервисного аккаунта).
+// Структура: chats/<чат> — название, тип, время последнего, счётчик;
+//            messages/<чат>/<idMessage> — само сообщение.
+
+const MESSAGE_WEBHOOKS = {
+  incomingMessageReceived: "incoming",       // написали в чат
+  outgoingMessageReceived: "outgoing",       // отправлено с телефона
+  outgoingAPIMessageReceived: "outgoing_api", // отправлено через API (этот бот)
+};
+
+let googleTokenCache = null; // живёт, пока жив экземпляр воркера
+
+const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+async function googleAccessToken(sa) {
+  if (googleTokenCache && googleTokenCache.exp > Date.now() + 60000) return googleTokenCache.token;
+  const now = Math.floor(Date.now() / 1000);
+  const part = (obj) => b64url(new TextEncoder().encode(JSON.stringify(obj)));
+  const unsigned = part({ alg: "RS256", typ: "JWT" }) + "." + part({
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  });
+  const der = Uint8Array.from(atob(sa.private_key.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "")), (ch) => ch.charCodeAt(0));
+  const key = await crypto.subtle.importKey("pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(unsigned)));
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: `${unsigned}.${b64url(sig)}` }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Google OAuth ${res.status}: ${JSON.stringify(data)}`);
+  googleTokenCache = { token: data.access_token, exp: Date.now() + data.expires_in * 1000 };
+  return data.access_token;
+}
+
+const firebaseReady = (env) => !!(env.FIREBASE_DB_URL && (env.FIREBASE_SECRET || env.FIREBASE_SERVICE_ACCOUNT));
+
+async function firebase(env, method, path, body) {
+  if (!firebaseReady(env)) throw new Error("Не заданы FIREBASE_DB_URL и FIREBASE_SECRET / FIREBASE_SERVICE_ACCOUNT");
+  const auth = env.FIREBASE_SECRET
+    ? "auth=" + encodeURIComponent(env.FIREBASE_SECRET.trim())
+    : "access_token=" + encodeURIComponent(await googleAccessToken(JSON.parse(env.FIREBASE_SERVICE_ACCOUNT)));
+  const res = await fetch(`${env.FIREBASE_DB_URL.trim().replace(/\/+$/, "")}${path}.json?${auth}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`Firebase ${method} ${path} ${res.status}: ${raw.slice(0, 300)}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+// В ключах Realtime Database нельзя . # $ [ ] /
+const fbKey = (s) => String(s).replace(/[.#$[\]/]/g, "_");
+
+function messageText(md) {
+  if (!md) return null;
+  return md.textMessageData?.textMessage
+    ?? md.extendedTextMessageData?.text
+    ?? md.fileMessageData?.caption
+    ?? md.editedMessageData?.textMessage
+    ?? null;
+}
+
+async function storeWebhook(env, body) {
+  const direction = MESSAGE_WEBHOOKS[body.typeWebhook];
+  const sd = body.senderData || {};
+  if (!direction || !sd.chatId || !body.idMessage) return false; // статусы, смена состояния и т.п. не храним
+  const chat = fbKey(sd.chatId);
+  const update = {
+    [`messages/${chat}/${fbKey(body.idMessage)}`]: {
+      direction,
+      timestamp: body.timestamp ?? null,
+      sender: sd.sender ?? null,
+      senderName: sd.senderName || sd.senderContactName || null,
+      type: body.messageData?.typeMessage ?? null,
+      text: messageText(body.messageData),
+      data: body.messageData ?? null,
+    },
+    [`chats/${chat}/chatId`]: sd.chatId,
+    [`chats/${chat}/isGroup`]: sd.chatId.endsWith("@g.us"),
+    [`chats/${chat}/lastAt`]: body.timestamp ?? null,
+    [`chats/${chat}/count`]: { ".sv": { increment: 1 } },
+  };
+  if (sd.chatName) update[`chats/${chat}/name`] = sd.chatName;
+  await firebase(env, "PATCH", "/", update);
+  return true;
+}
+
+// Прописывает адрес вебхука в Green API и включает уведомления о сообщениях.
+async function connectWebhook(env, origin) {
+  if (!env.WEBHOOK_SECRET) throw new Error("В Cloudflare не задан секрет WEBHOOK_SECRET");
+  const c = config(env, await loadSettings(env));
+  const webhookUrl = `${origin}/webhook/${env.WEBHOOK_SECRET}`;
+  const res = await apiCall(c, "setSettings", {
+    webhookUrl,
+    incomingWebhook: "yes",
+    outgoingWebhook: "yes",
+    outgoingAPIMessageWebhook: "yes",
+  });
+  return `Green API: ${JSON.stringify(res)}\nАдрес вебхука прописан. Green API может пару минут перезапускать инстанс.`;
+}
+
 // ---------------- Страница управления ----------------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
@@ -509,7 +622,35 @@ ${error ? `<div class="msg bad">${esc(error)}</div>` : ""}
 
 const checked = (v) => (v ? " checked" : "");
 
-async function dashboard(env, msg, result) {
+async function messagesSection(env, origin) {
+  const hook = env.WEBHOOK_SECRET ? `${origin}/webhook/${esc(env.WEBHOOK_SECRET)}` : null;
+  const rows = [
+    ["Firebase", firebaseReady(env) ? `<span class="ok">настроен</span>` : `<span class="bad">не настроен</span>`],
+    ["Адрес вебхука", hook ? `<code style="word-break:break-all">${hook}</code>` : `<span class="bad">нет секрета WEBHOOK_SECRET</span>`],
+  ];
+  let list = "";
+  if (firebaseReady(env)) {
+    try {
+      const chats = Object.values((await firebase(env, "GET", "/chats")) || {})
+        .sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0));
+      const total = chats.reduce((n, ch) => n + (ch.count || 0), 0);
+      rows.push(["Собрано", `${chats.length} чатов, ${total} сообщений`]);
+      list = chats.slice(0, 50).map((ch) => `<div class="row"><span>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}`
+        + `<br><small>${esc(ch.chatId)}</small></span><span>${ch.count || 0}<br><small>${ch.lastAt ? bakuTime(ch.lastAt * 1000) : ""}</small></span></div>`).join("");
+    } catch (e) {
+      rows.push(["Ошибка", `<span class="bad">${esc(e.message)}</span>`]);
+    }
+  }
+  return `<section><h2>Сообщения (Firebase)</h2>
+${rows.map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join("")}
+${list ? `<details><summary>Чаты</summary>${list}</details>` : ""}
+<form method="post" action="/action" class="btns" style="margin-top:10px">
+<button name="do" value="webhook" onclick="return confirm('Прописать адрес вебхука в Green API? Инстанс может перезапуститься на пару минут.')">🔗 Подключить вебхук в Green API</button>
+</form>
+</section>`;
+}
+
+async function dashboard(env, msg, result, origin) {
   const s = await loadSettings(env);
   const kv = env.MQM_KV;
   const [last, state, weatherDate] = kv
@@ -548,6 +689,8 @@ ${result ? `<section><h2>Результат</h2><div class="${result.ok ? "ok" :
 ${statusRows.map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join("")}
 ${last ? `<details><summary>Лог последнего запуска</summary><pre>${esc(last.log)}</pre></details>` : ""}
 </section>
+
+${await messagesSection(env, origin)}
 
 <form method="post" action="/save">
 <section><h2>Общее</h2>
@@ -636,7 +779,7 @@ async function saveSettings(request, env) {
   return reset ? "Сохранено. Ссылка или предметы изменились — сохранённые баллы сброшены." : "Сохранено.";
 }
 
-async function doAction(env, action) {
+async function doAction(env, action, origin) {
   const s = await loadSettings(env);
   const base = { exam: false, weather: false, test: false, clean: false, dump: false };
   const opts = {
@@ -646,6 +789,13 @@ async function doAction(env, action) {
     dump: { dump: true },
     clean: { clean: true },
   }[action];
+  if (action === "webhook") {
+    try {
+      return { ok: true, log: await connectWebhook(env, origin) };
+    } catch (e) {
+      return { ok: false, log: e.message };
+    }
+  }
   if (action === "reset") {
     await env.MQM_KV.delete("state");
     return { ok: true, log: "Сохранённые баллы сброшены. Следующая проверка запомнит текущие без сообщения." };
@@ -695,6 +845,24 @@ export default {
       });
     }
 
+    if (path.startsWith("/webhook/")) {
+      if (!env.WEBHOOK_SECRET || path !== `/webhook/${env.WEBHOOK_SECRET}`) return new Response("Not found", { status: 404 });
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Bad JSON", { status: 400 });
+      }
+      try {
+        await storeWebhook(env, body);
+      } catch (e) {
+        console.log("ОШИБКА вебхука:", e.message);
+        return new Response("Error", { status: 500 }); // Green API пришлёт уведомление повторно
+      }
+      return new Response("OK");
+    }
+
     if (path === "/login" && request.method === "POST") {
       if (!env.RUN_KEY) return loginPage("В Cloudflare не задан секрет RUN_KEY");
       const key = String((await request.formData()).get("key") || "");
@@ -723,16 +891,16 @@ export default {
         const msg = await saveSettings(request, env);
         return new Response(null, { status: 303, headers: { Location: "/?msg=" + encodeURIComponent(msg) } });
       } catch (e) {
-        return dashboard(env, `<span class="bad">Не сохранено: ${esc(e.message)}</span>`);
+        return dashboard(env, `<span class="bad">Не сохранено: ${esc(e.message)}</span>`, null, url.origin);
       }
     }
 
     if (path === "/action" && request.method === "POST") {
       const action = String((await request.formData()).get("do") || "");
-      return dashboard(env, null, await doAction(env, action));
+      return dashboard(env, null, await doAction(env, action, url.origin), url.origin);
     }
 
     const msg = url.searchParams.get("msg");
-    return dashboard(env, msg ? esc(msg) : null);
+    return dashboard(env, msg ? esc(msg) : null, null, url.origin);
   },
 };
