@@ -1,20 +1,21 @@
 // MQM watch на Cloudflare Workers: баллы с kabinet.mqm.az и утренний прогноз погоды
-// в WhatsApp-группу через Green API.
+// в WhatsApp-группу через Green API. Управление — страница https://<worker>.workers.dev/
 //
-// Привязки и секреты (Settings → Variables and Secrets / Bindings):
-//   MQM_KV              - KV namespace (состояние)
+// Привязки и секреты (Settings → Bindings / Variables and Secrets):
+//   MQM_KV              - KV namespace (настройки и состояние)
 //   GREEN_ID_INSTANCE   - idInstance (secret)
 //   GREEN_API_TOKEN     - apiTokenInstance (secret)
 //   GREEN_CHAT_ID       - id группы, можно без @g.us (secret)
-//   RUN_KEY             - ключ для ручного запуска по ссылке (secret)
+//   RUN_KEY             - пароль для страницы управления и ссылки /run (secret)
 //   GREEN_API_URL       - (необязательно) хост инстанса, по умолчанию https://api.green-api.com
-//   MQM_URL             - (необязательно) ссылка на результат
-//   WEATHER_PLACE / WEATHER_LAT / WEATHER_LON / WEATHER_SEND_HOUR / WEATHER_HOURS - (необязательно)
 //
-// Ручной запуск: https://<worker>.workers.dev/run?key=RUN_KEY&exam=1&weather=1&test=0&clean=0&dump=0
+// Cron Trigger в Cloudflare: "* * * * *" — воркер просыпается каждую минуту,
+// а как часто проверять экзамен, решает настройка на странице.
+//
+// Запуск ссылкой: /run?key=RUN_KEY&exam=1&weather=1&test=0&clean=0&dump=0
 
 const DEFAULT_URL = "https://kabinet.mqm.az/result/1505867/e40b3558-d105-4cc5-8752-594581ee467a";
-const SUBJECTS = ["İngilis dili", "Azərbaycan dili", "Riyaziyyat"];
+const DEFAULT_SUBJECTS = ["İngilis dili", "Azərbaycan dili", "Riyaziyyat"];
 const COUNTERS = {
   correct: /Doğru cavabların sayı:\s*(\d+)/,
   wrong: /Yanlış cavabların sayı:\s*(\d+)/,
@@ -26,6 +27,8 @@ const SCORE_PREFIX = "📊";
 const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test"];
 // Бесплатный план Cloudflare: не больше 50 внешних запросов за запуск.
 const MAX_DELETES = 40;
+// Бесплатный план KV: 1000 записей в сутки; каждая проверка пишет лог запуска.
+const MIN_INTERVAL = 5;
 
 const BAKU_OFFSET_MS = 4 * 3600 * 1000; // Азербайджан без перехода на летнее время
 const WEEKDAYS = ["Bazar ertəsi", "Çərşənbə axşamı", "Çərşənbə", "Cümə axşamı", "Cümə", "Şənbə", "Bazar"];
@@ -40,23 +43,44 @@ const NAMED_ENTITIES = {
   mdash: "—", ndash: "–", laquo: "«", raquo: "»",
 };
 
-function config(env) {
+// ---------------- Настройки ----------------
+
+function defaults(env) {
+  return {
+    enabled: true,
+    exam_enabled: true,
+    interval: 20,
+    url: env.MQM_URL || DEFAULT_URL,
+    title: "Asim Qaraxanov",
+    subjects: DEFAULT_SUBJECTS.join(", "),
+    weather_enabled: true,
+    place: env.WEATHER_PLACE || "Pirşağı",
+    lat: env.WEATHER_LAT || "40.49",
+    lon: env.WEATHER_LON || "50.01",
+    send_hour: parseInt(env.WEATHER_SEND_HOUR || "7", 10),
+    hours: parseInt(env.WEATHER_HOURS || "24", 10),
+    clean_enabled: true,
+  };
+}
+
+async function loadSettings(env) {
+  const saved = env.MQM_KV ? await env.MQM_KV.get("settings", "json") : null;
+  return { ...defaults(env), ...(saved || {}) };
+}
+
+function config(env, s) {
   let chat = (env.GREEN_CHAT_ID || "").trim();
   if (chat && !chat.includes("@")) chat += "@g.us";
   return {
-    env,
+    s,
     kv: env.MQM_KV,
-    url: env.MQM_URL || DEFAULT_URL,
+    subjects: s.subjects.split(",").map((x) => x.trim()).filter(Boolean),
     api: (env.GREEN_API_URL || "https://api.green-api.com").replace(/\/+$/, ""),
     id: (env.GREEN_ID_INSTANCE || "").trim(),
     token: (env.GREEN_API_TOKEN || "").trim(),
     chat,
     cleanCount: parseInt(env.CLEAN_HISTORY_COUNT || "200", 10),
-    place: env.WEATHER_PLACE || "Pirşağı",
-    lat: env.WEATHER_LAT || "40.49",
-    lon: env.WEATHER_LON || "50.01",
-    sendHour: parseInt(env.WEATHER_SEND_HOUR || "7", 10),
-    hours: parseInt(env.WEATHER_HOURS || "24", 10),
+    acted: false, // было ли реальное действие (для записи лога запуска)
     lines: [],
     log(...args) {
       const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
@@ -79,7 +103,7 @@ function unescapeHtml(s) {
 }
 
 async function fetchText(c) {
-  const res = await fetch(c.url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const res = await fetch(c.s.url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!res.ok) throw new Error(`Сайт MQM ответил ${res.status}`);
   let raw = await res.text();
   raw = raw.replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " ");
@@ -90,14 +114,14 @@ function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function parse(text) {
+function parse(text, subjects) {
   const m = text.match(/Yekun nəticə:\s*([\d.]+)\s*\/\s*Maksimum:\s*(\d+)/);
   if (!m) throw new Error("Не нашёл 'Yekun nəticə' на странице (формат изменился?)");
   const data = { total: parseFloat(m[1]), max: parseFloat(m[2]), subjects: {} };
 
   // начало блока каждого предмета -> блок идёт до начала следующего
   const starts = [];
-  for (const name of SUBJECTS) {
+  for (const name of subjects) {
     const h = new RegExp(escapeRe(name) + String.raw`\s*\(Maksimum:\s*\d+\)`).exec(text);
     if (h) starts.push([h.index, name]);
   }
@@ -150,9 +174,9 @@ function chg(prev, cur, f = String) {
   return prev !== undefined && prev !== cur ? `${f(prev)}→${f(cur)}` : f(cur);
 }
 
-function fmt(old, cur) {
+function fmt(old, cur, title) {
   const lines = [
-    "📊 Asim Qaraxanov — nəticə yeniləndi",
+    `📊 ${title} — nəticə yeniləndi`,
     old
       ? `Yekun: ${num(old.total)} → ${num(cur.total)} / ${cur.max}`
       : `Yekun: ${num(cur.total)} / ${cur.max}`,
@@ -171,28 +195,29 @@ function fmt(old, cur) {
 }
 
 async function checkResults(c, opts) {
+  c.acted = true;
   const text = await fetchText(c);
   if (opts.dump) {
     c.log(text);
-    c.log("\nНАЙДЕНО:", parse(text));
+    c.log("\nНАЙДЕНО:", parse(text, c.subjects));
     return;
   }
-  const cur = parse(text);
+  const cur = parse(text, c.subjects);
 
   if (opts.test) {
-    await send(c, "✅ Test: MQM watch işləyir\n" + fmt(null, cur).split("\n").slice(1).join("\n"));
+    await send(c, "✅ Test: MQM watch işləyir\n" + fmt(null, cur, c.s.title).split("\n").slice(1).join("\n"));
     return;
   }
 
   const old = await c.kv.get("state", "json");
   if (!old) {
     await c.kv.put("state", JSON.stringify(cur));
-    c.log("Первый запуск, сохранил базовое значение:", cur);
+    c.log("Первая проверка, запомнил текущие баллы:", cur);
     return;
   }
 
   if (cur.total !== old.total || !sameSubjects(cur.subjects, norm(old.subjects))) {
-    await send(c, fmt(old, cur)); // состояние сохраняем только после успешной отправки
+    await send(c, fmt(old, cur, c.s.title)); // состояние сохраняем только после успешной отправки
     await c.kv.put("state", JSON.stringify(cur));
   } else {
     c.log("Без изменений:", String(cur.total));
@@ -228,12 +253,17 @@ const ymd = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.ge
 const dm = (d) => `${pad(d.getUTCDate())}.${pad(d.getUTCMonth() + 1)}`;
 const hm = (d) => `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 const addHours = (d, h) => new Date(d.getTime() + h * 3600 * 1000);
+const bakuTime = (ms) => {
+  const d = new Date(ms + BAKU_OFFSET_MS);
+  return `${dm(d)} ${hm(d)}`;
+};
 
 // ---------------- Уборка старых сообщений бота ----------------
 
 // Удаляет у всех сообщения бота старше сегодняшних 00:00 (Баку).
 // Если сегодня не было сообщения с баллами — оставляет последнее более раннее.
 async function cleanupOld(c, dry) {
+  c.acted = true;
   const now = bakuNow();
   const cutoff = (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - BAKU_OFFSET_MS) / 1000;
   const history = (await apiCall(c, "getChatHistory", { chatId: c.chat, count: c.cleanCount })) || [];
@@ -261,8 +291,7 @@ async function cleanupOld(c, dry) {
 
   let deleted = 0, gone = 0, failed = 0;
   for (const m of todo) {
-    const when = new Date(m.timestamp * 1000 + BAKU_OFFSET_MS);
-    const label = `${dm(when)} ${hm(when)} «${m.textMessage.split("\n")[0].slice(0, 40)}»`;
+    const label = `${bakuTime(m.timestamp * 1000)} «${m.textMessage.split("\n")[0].slice(0, 40)}»`;
     if (dry) {
       c.log(`  [пробный режим] удалил бы ${label}`);
       continue;
@@ -293,8 +322,8 @@ async function cleanupOld(c, dry) {
 
 async function fetchWeather(c, startDay, endDay) {
   const qs = new URLSearchParams({
-    latitude: c.lat,
-    longitude: c.lon,
+    latitude: c.s.lat,
+    longitude: c.s.lon,
     hourly: "precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m",
     wind_speed_unit: "kmh",
     timezone: "Asia/Baku",
@@ -310,7 +339,7 @@ async function fetchWeather(c, startDay, endDay) {
 
 function fmtWeather(c, h, now) {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours()));
-  const end = addHours(start, c.hours);
+  const end = addHours(start, c.s.hours);
   const rows = [];
   h.time.forEach((t, i) => {
     const dt = new Date(t + ":00Z"); // Open-Meteo отдаёт местное время без зоны: "2026-10-30T07:00"
@@ -330,7 +359,7 @@ function fmtWeather(c, h, now) {
   const peak = rows.reduce((a, b) => (b.gust > a.gust ? b : a));
   const last = rows[rows.length - 1].dt;
   const lines = [
-    `🌦 ${c.place} — hava proqnozu`,
+    `🌦 ${c.s.place} — hava proqnozu`,
     `${WEEKDAYS[(now.getUTCDay() + 6) % 7]}, ${dm(now)}.${now.getUTCFullYear()}, ${hm(rows[0].dt)} → ${dm(last)} ${hm(last)}`,
     "",
     total >= 0.1 ? `🌧 Yağış: ${total.toFixed(1)} mm` : "☀️ Yağış gözlənilmir",
@@ -353,22 +382,27 @@ function fmtWeather(c, h, now) {
   return lines.join("\n");
 }
 
-// Раз в сутки после WEATHER_SEND_HOUR (по Баку): уборка старых сообщений, затем прогноз.
-// force=true — тест: уборка в пробном режиме (ничего не удаляет), дата отправки не пишется.
+// Раз в сутки после часа отправки (по Баку): уборка старых сообщений, затем прогноз.
+// force=true — «прогноз сейчас»: уборка в пробном режиме, дата отправки не пишется.
 async function dailyWeather(c, force) {
   const now = bakuNow();
   const today = ymd(now);
   const last = await c.kv.get("weather_date");
-  if (!force && (now.getUTCHours() < c.sendHour || last === today)) {
-    c.log(last === today ? "Погода: сегодня уже отправлена" : `Погода: ещё рано (шлём после ${c.sendHour}:00 по Баку)`);
+  if (!force && (now.getUTCHours() < c.s.send_hour || last === today)) {
+    c.log(last === today ? "Погода: сегодня уже отправлена" : `Погода: ещё рано (шлём после ${c.s.send_hour}:00 по Баку)`);
     return;
   }
+  c.acted = true;
   let cleanError = null;
-  try {
-    await cleanupOld(c, force);
-  } catch (e) { // сбой уборки не должен лишать прогноза
-    cleanError = e;
-    c.log("ОШИБКА уборки:", e.message);
+  if (c.s.clean_enabled) {
+    try {
+      await cleanupOld(c, force);
+    } catch (e) { // сбой уборки не должен лишать прогноза
+      cleanError = e;
+      c.log("ОШИБКА уборки:", e.message);
+    }
+  } else {
+    c.log("Уборка старых сообщений выключена");
   }
   const tomorrow = ymd(addHours(now, 24));
   await send(c, fmtWeather(c, await fetchWeather(c, today, tomorrow), now));
@@ -378,8 +412,8 @@ async function dailyWeather(c, force) {
 
 // ---------------- Запуск ----------------
 
-async function run(env, opts) {
-  const c = config(env);
+async function run(env, s, opts, source) {
+  const c = config(env, s);
   if (!c.kv) {
     c.log("ОШИБКА: не привязан KV namespace MQM_KV");
     return { ok: false, log: c.lines.join("\n") };
@@ -392,7 +426,7 @@ async function run(env, opts) {
     if (opts.exam) steps.push(["Экзамен", () => checkResults(c, opts)]);
     if (opts.weather) steps.push(["Погода", () => dailyWeather(c, opts.test)]);
   }
-  if (!steps.length) c.log("Нечего делать: exam=0 и weather=0");
+  if (!steps.length) c.log("Нечего делать: экзамен и погода не выбраны");
   // баллы и погода независимы: сбой одного не мешает другому
   for (const [name, step] of steps) {
     try {
@@ -402,38 +436,303 @@ async function run(env, opts) {
       c.log(`ОШИБКА (${name}):`, e.message);
     }
   }
-  return { ok, log: c.lines.join("\n") };
+  const log = c.lines.join("\n");
+  if (c.acted || !ok) {
+    await c.kv.put("last_run", JSON.stringify({ time: Date.now(), ok, source, log: log.slice(0, 8000) }));
+  }
+  return { ok, log };
+}
+
+// ---------------- Страница управления ----------------
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+async function authToken(env) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("mqm-watch:" + env.RUN_KEY));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function isAuthed(request, env) {
+  if (!env.RUN_KEY) return false;
+  const m = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)mqm_auth=([0-9a-f]+)/);
+  return !!m && m[1] === (await authToken(env));
+}
+
+const CSS = `
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1b1f24;--mut:#667085;--acc:#2563eb;--ok:#15803d;--bad:#dc2626;--line:#e3e6ea}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--mut:#9aa3af;--acc:#4f8df5;--ok:#4ade80;--bad:#f87171;--line:#2a2f37}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px}
+header{display:flex;justify-content:space-between;align-items:center;margin:4px 0 16px}
+h1{font-size:20px;margin:0}
+h2{font-size:15px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut)}
+a{color:var(--acc)}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:0 0 14px}
+label{display:block;margin:12px 0 0;font-size:14px;color:var(--mut)}
+input[type=text],input[type=url],input[type=number],input[type=password]{display:block;width:100%;margin-top:4px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font-size:16px}
+label.sw{display:flex;gap:12px;align-items:center;color:var(--fg);font-size:16px;margin:4px 0}
+label.sw input{width:22px;height:22px;accent-color:var(--acc);flex:none}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.hint{font-size:13px;color:var(--mut);margin:6px 0 0}
+button{font:inherit;padding:12px 14px;border-radius:10px;border:0;background:var(--acc);color:#fff;width:100%;cursor:pointer}
+.btns{display:grid;gap:8px}
+.btns button{background:transparent;color:var(--fg);border:1px solid var(--line);text-align:left}
+.btns button.danger{color:var(--bad)}
+.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+.row span:first-child{color:var(--mut)}
+.row span:last-child{text-align:right}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+.msg{padding:12px 14px;border-radius:10px;margin:0 0 14px;border:1px solid var(--line);background:var(--card)}
+pre{white-space:pre-wrap;word-break:break-word;font-size:13px;background:var(--bg);padding:10px;border-radius:8px;max-height:60vh;overflow:auto;margin:8px 0 0}
+details summary{cursor:pointer;color:var(--acc);margin-top:8px}
+`;
+
+function page(title, body, status = 200, headers = {}) {
+  return new Response(
+    `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
+      + `<title>${esc(title)}</title><style>${CSS}</style></head><body><main>${body}</main></body></html>`,
+    { status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...headers } },
+  );
+}
+
+function loginPage(error) {
+  return page("MQM watch", `
+<header><h1>MQM watch</h1></header>
+${error ? `<div class="msg bad">${esc(error)}</div>` : ""}
+<section><form method="post" action="/login">
+<label>Пароль (RUN_KEY)<input type="password" name="key" autocomplete="current-password" autofocus></label>
+<p></p><button>Войти</button>
+</form></section>`, error ? 403 : 200);
+}
+
+const checked = (v) => (v ? " checked" : "");
+
+async function dashboard(env, msg, result) {
+  const s = await loadSettings(env);
+  const kv = env.MQM_KV;
+  const [last, state, weatherDate] = kv
+    ? await Promise.all([kv.get("last_run", "json"), kv.get("state", "json"), kv.get("weather_date")])
+    : [null, null, null];
+
+  const tick = Math.floor(Date.now() / 60000);
+  const next = (tick + (s.interval - (tick % s.interval))) * 60000;
+  const today = ymd(bakuNow());
+
+  const statusRows = [
+    ["Бот", s.enabled ? `<span class="ok">включён</span>` : `<span class="bad">выключен</span>`],
+    ["Следующая проверка экзамена", s.enabled && s.exam_enabled ? `${bakuTime(next)} (каждые ${s.interval} мин)` : "—"],
+    ["Прогноз сегодня", !s.weather_enabled ? "выключен" : weatherDate === today ? "отправлен" : `ещё нет (в ${s.send_hour}:00)`],
+    ["Последний запуск", last
+      ? `${bakuTime(last.time)} · ${esc(last.source)} · ${last.ok ? `<span class="ok">OK</span>` : `<span class="bad">ошибка</span>`}`
+      : "ещё не было"],
+  ];
+  if (state) {
+    statusRows.push(["Сохранённые баллы", `${num(state.total)} / ${state.max}`]);
+    for (const [name, v] of Object.entries(norm(state.subjects))) {
+      statusRows.push([`• ${esc(name)}`, `${num(v.score)}`
+        + ("correct" in v ? ` (✅ ${v.correct} | ❌ ${v.wrong} | ⏳ ${v.unverified ?? 0})` : "")]);
+    }
+  } else {
+    statusRows.push(["Сохранённые баллы", "нет — следующая проверка запомнит текущие"]);
+  }
+  if (!kv) statusRows.unshift(["Внимание", `<span class="bad">не привязан KV namespace MQM_KV</span>`]);
+
+  return page("MQM watch", `
+<header><h1>MQM watch</h1><a href="/logout">Выйти</a></header>
+${msg ? `<div class="msg">${msg}</div>` : ""}
+${result ? `<section><h2>Результат</h2><div class="${result.ok ? "ok" : "bad"}">${result.ok ? "Готово" : "Ошибка"}</div><pre>${esc(result.log.slice(0, 50000))}</pre></section>` : ""}
+
+<section><h2>Статус</h2>
+${statusRows.map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join("")}
+${last ? `<details><summary>Лог последнего запуска</summary><pre>${esc(last.log)}</pre></details>` : ""}
+</section>
+
+<form method="post" action="/save">
+<section><h2>Общее</h2>
+<label class="sw"><input type="checkbox" name="enabled"${checked(s.enabled)}> Бот включён</label>
+<p class="hint">Выключено — по расписанию ничего не происходит. Кнопки ниже работают всегда.</p>
+</section>
+
+<section><h2>Экзамен</h2>
+<label class="sw"><input type="checkbox" name="exam_enabled"${checked(s.exam_enabled)}> Проверять баллы</label>
+<label>Как часто проверять, минут (от ${MIN_INTERVAL} до 1440)<input type="number" name="interval" min="${MIN_INTERVAL}" max="1440" value="${esc(s.interval)}"></label>
+<label>Ссылка на результат<input type="url" name="url" value="${esc(s.url)}"></label>
+<label>Имя в сообщении<input type="text" name="title" value="${esc(s.title)}"></label>
+<label>Предметы через запятую — точно как на сайте<input type="text" name="subjects" value="${esc(s.subjects)}"></label>
+<p class="hint">При смене ссылки или предметов сохранённые баллы сбрасываются: следующая проверка запомнит новые без сообщения.</p>
+</section>
+
+<section><h2>Погода</h2>
+<label class="sw"><input type="checkbox" name="weather_enabled"${checked(s.weather_enabled)}> Утренний прогноз</label>
+<label>Место (как в сообщении)<input type="text" name="place" value="${esc(s.place)}"></label>
+<div class="grid2">
+<label>Широта<input type="text" inputmode="decimal" name="lat" value="${esc(s.lat)}"></label>
+<label>Долгота<input type="text" inputmode="decimal" name="lon" value="${esc(s.lon)}"></label>
+<label>Час отправки (Баку)<input type="number" name="send_hour" min="0" max="23" value="${esc(s.send_hour)}"></label>
+<label>Часов вперёд<input type="number" name="hours" min="1" max="24" value="${esc(s.hours)}"></label>
+</div>
+<label class="sw" style="margin-top:14px"><input type="checkbox" name="clean_enabled"${checked(s.clean_enabled)}> Перед прогнозом удалять вчерашние сообщения бота</label>
+</section>
+
+<button>Сохранить настройки</button>
+</form>
+
+<p></p>
+<section><h2>Действия</h2>
+<form method="post" action="/action" class="btns">
+<button name="do" value="exam">🔄 Проверить экзамен сейчас</button>
+<button name="do" value="test">✅ Тестовое сообщение с баллами в группу</button>
+<button name="do" value="weather">🌦 Прислать прогноз сейчас</button>
+<button name="do" value="dump">🔍 Показать, что бот видит на странице экзамена</button>
+<button name="do" value="clean" class="danger" onclick="return confirm('Удалить у всех старые сообщения бота?')">🧹 Удалить старые сообщения бота</button>
+<button name="do" value="reset" class="danger" onclick="return confirm('Сбросить сохранённые баллы?')">↺ Сбросить сохранённые баллы</button>
+</form>
+</section>
+<p class="hint">Cron Trigger в Cloudflare должен быть <code>* * * * *</code> (каждую минуту) — частоту проверок задаёт настройка выше.</p>
+`);
+}
+
+async function saveSettings(request, env) {
+  const f = await request.formData();
+  const old = await loadSettings(env);
+  const str = (k) => String(f.get(k) ?? "").trim();
+  const int = (k, min, max, label) => {
+    const v = Number(str(k));
+    if (!Number.isInteger(v) || v < min || v > max) throw new Error(`${label}: целое число от ${min} до ${max}`);
+    return v;
+  };
+  const coord = (k, lim, label) => {
+    const v = Number(str(k).replace(",", "."));
+    if (!str(k) || !Number.isFinite(v) || Math.abs(v) > lim) throw new Error(`${label}: число от -${lim} до ${lim}`);
+    return String(v);
+  };
+  const url = str("url");
+  let u;
+  try { u = new URL(url); } catch { u = null; }
+  if (!u || u.protocol !== "https:") throw new Error("Ссылка на результат должна начинаться с https://");
+  const subjects = str("subjects").split(",").map((x) => x.trim()).filter(Boolean).join(", ");
+  if (!subjects) throw new Error("Укажите хотя бы один предмет");
+
+  const s = {
+    enabled: f.get("enabled") === "on",
+    exam_enabled: f.get("exam_enabled") === "on",
+    interval: int("interval", MIN_INTERVAL, 1440, "Частота проверки"),
+    url,
+    title: str("title") || "Asim Qaraxanov",
+    subjects,
+    weather_enabled: f.get("weather_enabled") === "on",
+    place: str("place") || "Pirşağı",
+    lat: coord("lat", 90, "Широта"),
+    lon: coord("lon", 180, "Долгота"),
+    send_hour: int("send_hour", 0, 23, "Час отправки"),
+    hours: int("hours", 1, 24, "Часов вперёд"),
+    clean_enabled: f.get("clean_enabled") === "on",
+  };
+  await env.MQM_KV.put("settings", JSON.stringify(s));
+  const reset = s.url !== old.url || s.subjects !== old.subjects;
+  if (reset) await env.MQM_KV.delete("state");
+  return reset ? "Сохранено. Ссылка или предметы изменились — сохранённые баллы сброшены." : "Сохранено.";
+}
+
+async function doAction(env, action) {
+  const s = await loadSettings(env);
+  const base = { exam: false, weather: false, test: false, clean: false, dump: false };
+  const opts = {
+    exam: { exam: true },
+    test: { exam: true, test: true },
+    weather: { weather: true, test: true },
+    dump: { dump: true },
+    clean: { clean: true },
+  }[action];
+  if (action === "reset") {
+    await env.MQM_KV.delete("state");
+    return { ok: true, log: "Сохранённые баллы сброшены. Следующая проверка запомнит текущие без сообщения." };
+  }
+  if (!opts) return { ok: false, log: "Неизвестное действие" };
+  return run(env, s, { ...base, ...opts }, "вручную");
 }
 
 function flag(params, name, def) {
   const v = params.get(name);
   if (v === null) return def;
-  return ["1", "true", "yes", "on", "da", "bəli"].includes(v.trim().toLowerCase());
+  return ["1", "true", "yes", "on"].includes(v.trim().toLowerCase());
 }
 
 export default {
-  async scheduled(event, env, ctx) {
-    const res = await run(env, { exam: true, weather: true, test: false, clean: false, dump: false });
+  async scheduled(event, env) {
+    const s = await loadSettings(env);
+    if (!s.enabled) return;
+    const tick = Math.floor(event.scheduledTime / 60000);
+    const res = await run(env, s, {
+      exam: s.exam_enabled && tick % s.interval === 0,
+      weather: s.weather_enabled,
+      test: false, clean: false, dump: false,
+    }, "по расписанию");
     if (!res.ok) throw new Error(res.log);
   },
 
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname !== "/run") return new Response("Not found", { status: 404 });
-    if (!env.RUN_KEY || url.searchParams.get("key") !== env.RUN_KEY) {
-      return new Response("Forbidden", { status: 403 });
+    const path = url.pathname;
+
+    if (path === "/run") {
+      if (!env.RUN_KEY || url.searchParams.get("key") !== env.RUN_KEY) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      const p = url.searchParams;
+      const res = await run(env, await loadSettings(env), {
+        exam: flag(p, "exam", true),
+        weather: flag(p, "weather", true),
+        test: flag(p, "test", false),
+        clean: flag(p, "clean", false),
+        dump: flag(p, "dump", false),
+      }, "по ссылке");
+      return new Response((res.ok ? "OK\n\n" : "ОШИБКА\n\n") + res.log, {
+        status: res.ok ? 200 : 500,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
     }
-    const p = url.searchParams;
-    const res = await run(env, {
-      exam: flag(p, "exam", true),
-      weather: flag(p, "weather", true),
-      test: flag(p, "test", false),
-      clean: flag(p, "clean", false),
-      dump: flag(p, "dump", false),
-    });
-    return new Response((res.ok ? "OK\n\n" : "ОШИБКА\n\n") + res.log, {
-      status: res.ok ? 200 : 500,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
+
+    if (path === "/login" && request.method === "POST") {
+      if (!env.RUN_KEY) return loginPage("В Cloudflare не задан секрет RUN_KEY");
+      const key = String((await request.formData()).get("key") || "");
+      if (key !== env.RUN_KEY) return loginPage("Неверный пароль");
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: "/",
+          "Set-Cookie": `mqm_auth=${await authToken(env)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=7776000`,
+        },
+      });
+    }
+
+    if (path === "/logout") {
+      return new Response(null, {
+        status: 303,
+        headers: { Location: "/", "Set-Cookie": "mqm_auth=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0" },
+      });
+    }
+
+    if (path !== "/" && path !== "/save" && path !== "/action") return new Response("Not found", { status: 404 });
+    if (!(await isAuthed(request, env))) return loginPage();
+
+    if (path === "/save" && request.method === "POST") {
+      try {
+        const msg = await saveSettings(request, env);
+        return new Response(null, { status: 303, headers: { Location: "/?msg=" + encodeURIComponent(msg) } });
+      } catch (e) {
+        return dashboard(env, `<span class="bad">Не сохранено: ${esc(e.message)}</span>`);
+      }
+    }
+
+    if (path === "/action" && request.method === "POST") {
+      const action = String((await request.formData()).get("do") || "");
+      return dashboard(env, null, await doAction(env, action));
+    }
+
+    const msg = url.searchParams.get("msg");
+    return dashboard(env, msg ? esc(msg) : null);
   },
 };

@@ -2,9 +2,9 @@ name = "mqm-watch"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 
-# время в UTC; минуты совпадают с Баку
+# каждую минуту; частоту проверок задаёт страница управления
 [triggers]
-crons = ["6,25,45 * * * *"]
+crons = ["* * * * *"]
 
 [[kv_namespaces]]
 binding = "MQM_KV"
