@@ -718,18 +718,41 @@ function transcript(list) {
   return { text: lines.slice(from).join("\n"), used: lines.length - from, all: lines.length };
 }
 
-async function gemini(env, model, prompt) {
-  if (!env.GEMINI_API_KEY) throw new Error("В Cloudflare не задан секрет GEMINI_API_KEY");
+const GEMINI_FALLBACK = "gemini-flash-lite-latest";
+
+async function geminiOnce(env, model, prompt) {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY.trim() },
     body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3 } }),
   });
   const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`Gemini ${res.status}: ${data?.error?.message || "нет ответа"}`);
+  if (!res.ok) {
+    const err = new Error(`Gemini ${res.status}: ${data?.error?.message || "нет ответа"}`);
+    err.busy = res.status === 503 || res.status === 429 || res.status === 500;
+    throw err;
+  }
   const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
   if (!text) throw new Error("Gemini не дал ответа" + (data?.promptFeedback?.blockReason ? ` (${data.promptFeedback.blockReason})` : ""));
   return text;
+}
+
+// При перегрузке (503/429/500): ещё две попытки через 2 и 5 с, затем запасная лёгкая модель.
+async function gemini(env, model, prompt) {
+  if (!env.GEMINI_API_KEY) throw new Error("В Cloudflare не задан секрет GEMINI_API_KEY");
+  const plan = [[model, 0], [model, 2000], [model, 5000]];
+  if (model !== GEMINI_FALLBACK) plan.push([GEMINI_FALLBACK, 0], [GEMINI_FALLBACK, 3000]);
+  let last;
+  for (const [m, wait] of plan) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    try {
+      return { text: await geminiOnce(env, m, prompt), model: m };
+    } catch (e) {
+      last = e;
+      if (!e.busy) throw e;
+    }
+  }
+  throw new Error(`Gemini сейчас перегружен, попробуйте через несколько минут. (${last.message})`);
 }
 
 // Минимальная разметка ответа Gemini: экранируем, затем **жирный** и заголовки #.
@@ -777,11 +800,11 @@ async function analyze(env, form) {
   if (!tr.used) return { a, ok: true, html: head + "<p>За этот период сообщений от участников нет.</p>" + hint };
   if (a.action === "ask" && !a.question) return { a, ok: false, html: head + "Напишите вопрос в поле «Вопрос»." };
   const intro = a.action === "ask" ? `${ASK_PROMPT}\n\nВопрос: ${a.question}` : SUMMARY_PROMPT;
-  const answer = await gemini(env, s.gemini_model, `${intro}\n\nЧат: «${name}», период: ${PERIODS[a.hours]}.\nПереписка:\n${tr.text}`);
+  const { text: answer, model } = await gemini(env, s.gemini_model, `${intro}\n\nЧат: «${name}», период: ${PERIODS[a.hours]}.\nПереписка:\n${tr.text}`);
   const note = tr.used < tr.all ? `<p class="hint">Gemini получил последние ${tr.used} из ${tr.all} сообщений — остальные не поместились.</p>` : "";
   const title = a.action === "ask" ? `<p class="hint">Вопрос: ${esc(a.question)}</p>` : "";
   return { a, ok: true, html: head + title + `<div class="md">${mdLite(answer)}</div>` + note
-    + `<p class="hint">Модель ${esc(s.gemini_model)} · сообщений: ${tr.used}</p>` + hint };
+    + `<p class="hint">Модель ${esc(model)}${model !== s.gemini_model ? " (запасная — основная была перегружена)" : ""} · сообщений: ${tr.used}</p>` + hint };
 }
 
 async function analysisSection(env, a = {}) {
