@@ -1,6 +1,8 @@
 name = "mqm-watch"
 main = "worker.js"
 compatibility_date = "2026-10-01"
+# не удалять переменные, добавленные в панели Cloudflare, при выкладке из GitHub
+keep_vars = true
 
 # каждую минуту; частоту проверок задаёт страница управления
 [triggers]
