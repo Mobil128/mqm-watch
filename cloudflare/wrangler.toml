@@ -14,3 +14,7 @@ id = "3876d11e0fd14259ab6aa15d6b5b3b69"
 
 [observability]
 enabled = true
+
+# номер и время версии — показываются на странице управления
+[version_metadata]
+binding = "CF_VERSION_METADATA"

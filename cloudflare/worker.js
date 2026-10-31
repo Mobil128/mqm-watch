@@ -508,6 +508,23 @@ async function googleAccessToken(sa) {
   return data.access_token;
 }
 
+// Только наличие, без значений.
+function secretsReport(env) {
+  const need = ["GREEN_ID_INSTANCE", "GREEN_API_TOKEN", "GREEN_CHAT_ID", "RUN_KEY", "WEBHOOK_SECRET", "FIREBASE_DB_URL"];
+  const missing = need.filter((k) => !String(env[k] ?? "").trim());
+  if (!env.FIREBASE_SECRET && !env.FIREBASE_SERVICE_ACCOUNT) missing.push("FIREBASE_SECRET или FIREBASE_SERVICE_ACCOUNT");
+  const notes = missing.map((k) => `<span class="bad">нет ${k}</span>`);
+  if (env.FIREBASE_SERVICE_ACCOUNT && !env.FIREBASE_SECRET) {
+    try {
+      const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
+      if (!sa.client_email || !sa.private_key) notes.push(`<span class="bad">в FIREBASE_SERVICE_ACCOUNT нет client_email/private_key</span>`);
+    } catch {
+      notes.push(`<span class="bad">FIREBASE_SERVICE_ACCOUNT — не JSON</span>`);
+    }
+  }
+  return notes.length ? notes.join("<br>") : `<span class="ok">все на месте</span>`;
+}
+
 const firebaseReady = (env) => !!(env.FIREBASE_DB_URL && (env.FIREBASE_SECRET || env.FIREBASE_SERVICE_ACCOUNT));
 
 async function firebase(env, method, path, body) {
@@ -745,6 +762,11 @@ async function dashboard(env, msg, result, origin) {
     statusRows.push(["Сохранённые баллы", "нет — следующая проверка запомнит текущие"]);
   }
   if (!kv) statusRows.unshift(["Внимание", `<span class="bad">не привязан KV namespace MQM_KV</span>`]);
+  const v = env.CF_VERSION_METADATA;
+  statusRows.push(["Версия воркера", v?.id
+    ? `${esc(v.id.slice(0, 8))}${v.timestamp ? ` · ${bakuTime(Date.parse(v.timestamp))}` : ""}`
+    : "неизвестно"]);
+  statusRows.push(["Секреты, которые видит воркер", secretsReport(env)]);
 
   return page("MQM watch", `
 <header><h1>MQM watch</h1><a href="/logout">Выйти</a></header>
