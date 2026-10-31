@@ -39,6 +39,7 @@ const WEEKDAYS = ["Bazar ertəsi", "Çərşənbə axşamı", "Çərşənbə", "C
 // откуда дует ветер: «şimal küləyi» = с севера
 const DIRS = ["şimal", "şimal-şərq", "şərq", "cənub-şərq", "cənub", "cənub-qərb", "qərb", "şimal-qərb"];
 const STRONG_GUST = 50; // км/ч: от этого значения ставим ⚠️
+const PARTS = ["Gecə", "Səhər", "Gündüz", "Axşam"];
 
 const NAMED_ENTITIES = {
   amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
@@ -343,7 +344,10 @@ async function fetchWeather(c, startDay, endDay) {
 
 function fmtWeather(c, h, now) {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours()));
-  const end = addHours(start, c.s.hours);
+  // обрезаем по границе части суток, чтобы в конце не было обрывка в час-два
+  const full = addHours(start, c.s.hours);
+  const cut = addHours(full, -(full.getUTCHours() % 6));
+  const end = cut > start ? cut : full;
   const rows = [];
   h.time.forEach((t, i) => {
     const dt = new Date(t + ":00Z"); // Open-Meteo отдаёт местное время без зоны: "2026-10-30T07:00"
@@ -361,28 +365,38 @@ function fmtWeather(c, h, now) {
 
   const total = rows.reduce((s, r) => s + r.rain, 0);
   const peak = rows.reduce((a, b) => (b.gust > a.gust ? b : a));
-  const last = rows[rows.length - 1].dt;
+  const wet = rows.filter((r) => r.rain >= 0.1);
   const lines = [
     `🌦 ${c.s.place} — hava proqnozu`,
-    `${WEEKDAYS[(now.getUTCDay() + 6) % 7]}, ${dm(now)}.${now.getUTCFullYear()}, ${hm(rows[0].dt)} → ${dm(last)} ${hm(last)}`,
-    "",
-    total >= 0.1 ? `🌧 Yağış: ${total.toFixed(1)} mm` : "☀️ Yağış gözlənilmir",
-    `💨 Ən güclü külək: ${peak.gust.toFixed(0)} km/saat, ${dm(peak.dt)} saat ${hm(peak.dt)}`,
+    `${WEEKDAYS[(now.getUTCDay() + 6) % 7]}, ${dm(now)}.${now.getUTCFullYear()}`,
+    total >= 0.1
+      ? `🌧 Yağış: ${total.toFixed(1)} mm, saat ${hm(wet[0].dt)}–${hm(addHours(wet[wet.length - 1].dt, 1))}`
+      : "☀️ Yağış gözlənilmir",
+    `💨 Ən güclü külək: ${peak.gust.toFixed(0)} km/saat, ${dm(peak.dt)} saat ${hm(peak.dt)}${peak.gust >= STRONG_GUST ? " ⚠️" : ""}`,
     "",
   ];
-  let day = ymd(rows[0].dt);
+  // части суток подряд: ночь 0–6, утро 6–12, день 12–18, вечер 18–24
+  const parts = [];
   for (const r of rows) {
-    if (ymd(r.dt) !== day) { // перешли за полночь
-      day = ymd(r.dt);
-      lines.push(`— ${dm(r.dt)} —`);
-    }
-    const rain = r.rain >= 0.1
-      ? `🌧 ${r.rain.toFixed(1)} mm` + (r.prob != null ? ` (${r.prob}%)` : "")
-      : r.prob ? `yağış yox (${r.prob}%)` : "yağış yox";
-    const warn = r.gust >= STRONG_GUST ? " ⚠️" : "";
-    lines.push(`${hm(r.dt)} · ${rain} · 💨 ${r.wind.toFixed(0)} (${r.gust.toFixed(0)}) km/saat, ${r.dir}${warn}`);
+    const key = ymd(r.dt) + Math.floor(r.dt.getUTCHours() / 6);
+    if (!parts.length || parts[parts.length - 1].key !== key) parts.push({ key, rows: [] });
+    parts[parts.length - 1].rows.push(r);
   }
-  lines.push("", "Mötərizədə: yağış ehtimalı (%) və ani külək (km/saat)");
+  for (const { rows: pr } of parts) {
+    const first = pr[0].dt.getUTCHours();
+    const until = pr[pr.length - 1].dt.getUTCHours() + 1;
+    const rain = pr.reduce((s, r) => s + r.rain, 0);
+    const prob = Math.max(0, ...pr.map((r) => r.prob ?? 0));
+    const winds = pr.map((r) => Math.round(r.wind));
+    const gust = Math.max(...pr.map((r) => r.gust));
+    const dirs = {};
+    pr.forEach((r) => { dirs[r.dir] = (dirs[r.dir] || 0) + 1; });
+    const dir = Object.keys(dirs).reduce((a, b) => (dirs[b] > dirs[a] ? b : a));
+    const lo = Math.min(...winds), hi = Math.max(...winds);
+    lines.push(`${PARTS[Math.floor(first / 6)]} ${pad(first)}–${pad(until)}: `
+      + (rain >= 0.1 ? `🌧 ${rain.toFixed(1)} mm` : prob >= 30 ? `yağış ehtimalı ${prob}%` : "yağış yox")
+      + ` · 💨 ${lo === hi ? lo : `${lo}–${hi}`} km/saat, ani ${gust.toFixed(0)}, ${dir}${gust >= STRONG_GUST ? " ⚠️" : ""}`);
+  }
   return lines.join("\n");
 }
 
