@@ -67,6 +67,7 @@ function defaults(env) {
     hours: parseInt(env.WEATHER_HOURS || "24", 10),
     clean_enabled: true,
     gemini_model: "gemini-flash-latest",
+    gemini_lang: "ru",
   };
 }
 
@@ -763,19 +764,26 @@ function mdLite(text) {
     .replace(/^\s*[*-]\s+/gm, "• ");
 }
 
-const SUMMARY_PROMPT = `Ты помогаешь разобрать переписку WhatsApp-чата. Сообщения могут быть на азербайджанском, русском или турецком.
-Ответь по-русски, кратко, по разделам:
-1. Коротко — 2–3 предложения о главном.
-2. Темы — списком.
-3. Решения и договорённости — кто, что, к какому сроку.
-4. Вопросы и просьбы без ответа.
-5. Важное и срочное — даты, суммы, встречи.
-6. Настроение в чате — одной строкой.
-Опирайся только на переписку и ничего не выдумывай; если в разделе пусто, напиши «нет». Не выписывай номера телефонов.`;
+const LANGS = {
+  ru: ["Русский", "Russian"],
+  az: ["Azərbaycanca", "Azerbaijani"],
+  en: ["English", "English"],
+  tr: ["Türkçe", "Turkish"],
+};
 
-const ASK_PROMPT = `Ты отвечаешь на вопрос по переписке WhatsApp-чата. Сообщения могут быть на азербайджанском, русском или турецком.
-Отвечай по-русски, коротко, опираясь только на переписку. Где уместно — укажи, кто и когда это написал.
-Если в переписке ответа нет — так и скажи. Не выписывай номера телефонов.`;
+const summaryPrompt = (lang) => `You analyze a WhatsApp chat. Messages may be in Azerbaijani, Russian or Turkish.
+Write the whole answer in ${lang}, concisely, with these sections (translate the headings into ${lang}):
+1. In short — 2–3 sentences about the main points.
+2. Topics — a list.
+3. Decisions and agreements — who, what, by when.
+4. Open questions and requests left without an answer.
+5. Important and urgent — dates, amounts, meetings.
+6. Mood in the chat — one line.
+Use only the chat and invent nothing; if a section is empty, say so in one word. Do not output phone numbers.`;
+
+const askPrompt = (lang) => `You answer a question about a WhatsApp chat. Messages may be in Azerbaijani, Russian or Turkish.
+Answer in ${lang}, briefly, using only the chat. Where useful, say who wrote it and when.
+If the chat does not contain the answer, say so. Do not output phone numbers.`;
 
 async function analyze(env, form) {
   const s = await loadSettings(env);
@@ -784,6 +792,7 @@ async function analyze(env, form) {
     hours: Number(form.get("period")) in PERIODS ? Number(form.get("period")) : 24,
     question: String(form.get("question") || "").trim().slice(0, 1000),
     action: String(form.get("do") || "stats"),
+    lang: LANGS[String(form.get("lang"))] ? String(form.get("lang")) : s.gemini_lang,
   };
   if (!a.chat) return { a, ok: false, html: "Выберите чат." };
   const chats = (await firebase(env, "GET", "/chats")) || {};
@@ -791,7 +800,7 @@ async function analyze(env, form) {
   const name = chat?.name || a.chat;
   const since = Math.floor(Date.now() / 1000) - a.hours * 3600;
   const { list, indexed } = await loadMessages(env, a.chat, since);
-  const head = `<p><b>${esc(name)}</b> · за ${PERIODS[a.hours]}</p>`;
+  const head = `<h2>${esc(name)} <span class="meta">за ${PERIODS[a.hours]}</span></h2>`;
   const hint = indexed ? "" : `<details><summary>Совет: индекс в Firebase</summary><pre>${esc(FIREBASE_INDEX_HINT)}</pre></details>`;
 
   if (a.action === "stats") return { a, ok: true, html: head + statsHtml(list, a.hours) + hint };
@@ -799,39 +808,13 @@ async function analyze(env, form) {
   const tr = transcript(list);
   if (!tr.used) return { a, ok: true, html: head + "<p>За этот период сообщений от участников нет.</p>" + hint };
   if (a.action === "ask" && !a.question) return { a, ok: false, html: head + "Напишите вопрос в поле «Вопрос»." };
-  const intro = a.action === "ask" ? `${ASK_PROMPT}\n\nВопрос: ${a.question}` : SUMMARY_PROMPT;
-  const { text: answer, model } = await gemini(env, s.gemini_model, `${intro}\n\nЧат: «${name}», период: ${PERIODS[a.hours]}.\nПереписка:\n${tr.text}`);
+  const lang = LANGS[a.lang][1];
+  const intro = a.action === "ask" ? `${askPrompt(lang)}\n\nQuestion: ${a.question}` : summaryPrompt(lang);
+  const { text: answer, model } = await gemini(env, s.gemini_model, `${intro}\n\nChat: "${name}", period: last ${a.hours} hours.\nMessages:\n${tr.text}`);
   const note = tr.used < tr.all ? `<p class="hint">Gemini получил последние ${tr.used} из ${tr.all} сообщений — остальные не поместились.</p>` : "";
   const title = a.action === "ask" ? `<p class="hint">Вопрос: ${esc(a.question)}</p>` : "";
   return { a, ok: true, html: head + title + `<div class="md">${mdLite(answer)}</div>` + note
-    + `<p class="hint">Модель ${esc(model)}${model !== s.gemini_model ? " (запасная — основная была перегружена)" : ""} · сообщений: ${tr.used}</p>` + hint };
-}
-
-async function analysisSection(env, a = {}) {
-  if (!firebaseReady(env)) return "";
-  let options = "";
-  try {
-    const chats = Object.values((await firebase(env, "GET", "/chats")) || {}).sort((x, y) => (y.lastAt || 0) - (x.lastAt || 0));
-    options = chats.map((ch) => `<option value="${esc(ch.chatId)}"${ch.chatId === a.chat ? " selected" : ""}>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}</option>`).join("");
-  } catch (e) {
-    return `<section id="analysis"><h2>Анализ переписки</h2><p class="bad">${esc(e.message)}</p></section>`;
-  }
-  if (!options) return `<section id="analysis"><h2>Анализ переписки</h2><p class="hint">Пока нет собранных чатов.</p></section>`;
-  const hours = a.hours || 24;
-  return `<section id="analysis"><h2>Анализ переписки</h2>
-<form method="post" action="/analyze">
-<label>Чат<select name="chat">${options}</select></label>
-<label>Период<select name="period">${Object.entries(PERIODS).map(([h, l]) => `<option value="${h}"${Number(h) === hours ? " selected" : ""}>${l}</option>`).join("")}</select></label>
-<label>Вопрос (для кнопки «Спросить»)<textarea name="question" rows="2" placeholder="Например: что решили про субботу?">${esc(a.question || "")}</textarea></label>
-<div class="btns" style="margin-top:12px">
-<button name="do" value="stats">📊 Статистика</button>
-<button name="do" value="summary">🤖 Разбор Gemini</button>
-<button name="do" value="ask">❓ Спросить Gemini</button>
-</div>
-</form>
-${env.GEMINI_API_KEY ? "" : `<p class="hint bad">Для разбора и вопросов добавьте секрет GEMINI_API_KEY. Статистика работает без него.</p>`}
-<p class="hint">Ничего не отправляется в группы. Переписка уходит в Gemini только по кнопкам 🤖 и ❓.</p>
-</section>`;
+    + `<p class="hint">${esc(LANGS[a.lang][0])} · модель ${esc(model)}${model !== s.gemini_model ? " (запасная — основная была перегружена)" : ""} · сообщений: ${tr.used}</p>` + hint };
 }
 
 // ---------------- Страница управления ----------------
@@ -849,39 +832,78 @@ async function isAuthed(request, env) {
   return !!m && m[1] === (await authToken(env));
 }
 
+const TABS = ["home", "analysis", "settings", "service"];
+const INTERVALS = [5, 10, 15, 20, 30, 60, 120, 180, 360, 720, 1440];
+const intervalLabel = (m) => (m < 60 ? `каждые ${m} мин` : m === 60 ? "каждый час" : m === 1440 ? "раз в сутки" : `каждые ${m / 60} ч`);
+
 const CSS = `
-:root{--bg:#f4f5f7;--card:#fff;--fg:#1b1f24;--mut:#667085;--acc:#2563eb;--ok:#15803d;--bad:#dc2626;--line:#e3e6ea}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--mut:#9aa3af;--acc:#4f8df5;--ok:#4ade80;--bad:#f87171;--line:#2a2f37}}
+:root{--bg:#f3f4f6;--card:#fff;--fg:#14181f;--mut:#5f6876;--line:#e2e5ea;--acc:#1f6feb;--acc-soft:#e8f0fe;--ok:#14803c;--ok-soft:#e7f6ec;--bad:#c62828;--bad-soft:#fdecec;--warn:#9a5b00;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1014;--card:#171b21;--fg:#e8ebef;--mut:#98a2b0;--line:#272d36;--acc:#5b9cff;--acc-soft:#16253d;--ok:#4cc77a;--ok-soft:#14261b;--bad:#ff7a70;--bad-soft:#2d1716;--warn:#f0a43c;color-scheme:dark}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-main{max-width:640px;margin:0 auto;padding:16px}
-header{display:flex;justify-content:space-between;align-items:center;margin:4px 0 16px}
-h1{font-size:20px;margin:0}
-h2{font-size:15px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut)}
-a{color:var(--acc)}
-section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:0 0 14px}
-label{display:block;margin:12px 0 0;font-size:14px;color:var(--mut)}
-input[type=text],input[type=url],input[type=number],input[type=password]{display:block;width:100%;margin-top:4px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font-size:16px}
-label.sw{display:flex;gap:12px;align-items:center;color:var(--fg);font-size:16px;margin:4px 0}
-label.sw input{width:22px;height:22px;accent-color:var(--acc);flex:none}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
-.hint{font-size:13px;color:var(--mut);margin:6px 0 0}
-button{font:inherit;padding:12px 14px;border-radius:10px;border:0;background:var(--acc);color:#fff;width:100%;cursor:pointer}
+html,body{margin:0}
+body{background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding-bottom:calc(76px + env(safe-area-inset-bottom))}
+main{max-width:640px;margin:0 auto;padding:12px 16px 24px;display:grid;gap:12px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:4px 2px}
+.top h1{font-size:20px;margin:0;font-weight:650}
+.top a{color:var(--mut);font-size:14px;text-decoration:none}
+.panel{display:grid;gap:12px}
+.panel[hidden]{display:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;display:grid;gap:10px}
+.card h2{font-size:17px;margin:0;font-weight:650;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.meta{font-size:14px;color:var(--mut);margin:0}
+.big{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+.big small{font-size:16px;color:var(--mut);font-weight:500}
+.subj{display:grid;gap:4px;font-size:14px}
+.subj div{display:flex;justify-content:space-between;gap:12px}
+.subj span:last-child{font-variant-numeric:tabular-nums;color:var(--mut)}
+.alert{border-radius:12px;padding:12px 14px;background:var(--bad-soft);color:var(--bad);font-size:14px}
+.alert b{display:block;margin-bottom:2px}
+.toast{border-radius:12px;padding:12px 14px;background:var(--ok-soft);color:var(--ok);font-size:15px}
+.toast.bad{background:var(--bad-soft);color:var(--bad)}
+.row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line);font-size:15px}
+.row:first-of-type{border-top:0}
+.row>span:first-child{color:var(--mut)}
+.row>span:last-child{text-align:right;word-break:break-word}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+label{display:grid;gap:4px;font-size:14px;color:var(--mut)}
+input[type=text],input[type=url],input[type=password],select,textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px}
+textarea{resize:vertical}
+input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;font:inherit;font-weight:600;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;text-decoration:none}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn.danger{color:var(--bad)}
+.btn:disabled{opacity:.6}
 .btns{display:grid;gap:8px}
-.btns button{background:transparent;color:var(--fg);border:1px solid var(--line);text-align:left}
-.btns button.danger{color:var(--bad)}
-.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)}
-.row:last-child{border-bottom:0}
-.row span:first-child{color:var(--mut)}
-.row span:last-child{text-align:right}
-.ok{color:var(--ok)}.bad{color:var(--bad)}
-.msg{padding:12px 14px;border-radius:10px;margin:0 0 14px;border:1px solid var(--line);background:var(--card)}
-pre{white-space:pre-wrap;word-break:break-word;font-size:13px;background:var(--bg);padding:10px;border-radius:8px;max-height:60vh;overflow:auto;margin:8px 0 0}
-details summary{cursor:pointer;color:var(--acc);margin-top:8px}
-select,textarea{display:block;width:100%;margin-top:4px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px}
-h3{font-size:14px;margin:18px 0 8px;color:var(--mut);font-weight:600}
-.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}
-.tile{border:1px solid var(--line);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:2px}
+.btns.two{grid-template-columns:1fr 1fr}
+.switch{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:16px;color:var(--fg)}
+.switch input{appearance:none;-webkit-appearance:none;width:50px;height:30px;border-radius:999px;background:var(--line);position:relative;flex:none;cursor:pointer;transition:background .15s}
+.switch input::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .15s}
+.switch input:checked{background:var(--ok)}
+.switch input:checked::after{transform:translateX(20px)}
+.seg{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:4px}
+.seg label{display:block;cursor:pointer}
+.seg input{position:absolute;opacity:0;pointer-events:none}
+.seg span{display:block;text-align:center;padding:8px 2px;border-radius:9px;font-size:14px;color:var(--fg)}
+.seg input:checked+span{background:var(--card);box-shadow:0 1px 3px rgba(0,0,0,.15);font-weight:600}
+.seg input:focus-visible+span{outline:2px solid var(--acc)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+details{font-size:14px}
+details summary{cursor:pointer;color:var(--acc);padding:2px 0}
+details[open] summary{margin-bottom:8px}
+.adv{display:grid;gap:10px}
+pre{white-space:pre-wrap;word-break:break-word;font-size:13px;background:var(--bg);padding:10px;border-radius:10px;max-height:55vh;overflow:auto;margin:0}
+code{font-size:13px;word-break:break-all}
+.hint{font-size:13px;color:var(--mut);margin:0}
+.savebar{position:sticky;bottom:calc(72px + env(safe-area-inset-bottom));z-index:1}
+.nav{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(4,1fr);padding:6px 4px calc(6px + env(safe-area-inset-bottom));z-index:2}
+.nav a{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:12px;color:var(--mut);text-decoration:none;padding:4px 0;border-radius:10px}
+.nav a[aria-current=page]{color:var(--acc);font-weight:600}
+.nav svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.chat{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+.chat small{color:var(--mut)}
+h3{font-size:14px;margin:6px 0 0;color:var(--mut);font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.tile{border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:2px}
 .tile b{font-size:22px;font-variant-numeric:tabular-nums}
 .tile span{font-size:12px;color:var(--mut)}
 .brow{display:grid;grid-template-columns:minmax(0,38%) 1fr 3ch;gap:8px;align-items:center;padding:3px 0;font-size:14px}
@@ -895,179 +917,292 @@ h3{font-size:14px;margin:18px 0 8px;color:var(--mut);font-weight:600}
 .cols-axis{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);margin-top:4px}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chipx{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:13px}
-.md{white-space:pre-wrap;word-break:break-word;font-size:15px;line-height:1.5}
+.md{white-space:pre-wrap;word-break:break-word;font-size:15px;line-height:1.55}
+@media (prefers-reduced-motion:reduce){.switch input,.switch input::after{transition:none}}
 `;
 
-function page(title, body, status = 200, headers = {}) {
+// Вкладки, подтверждения и «Подождите…» на кнопках. Без JS все вкладки видны подряд.
+const CLIENT_JS = `
+(function(){
+  var tabs = ["home","analysis","settings","service"];
+  var start = document.body.getAttribute("data-tab") || "home";
+  function show(t){
+    if (tabs.indexOf(t) < 0) t = start;
+    tabs.forEach(function(x){ var p = document.getElementById("p-" + x); if (p) p.hidden = x !== t; });
+    document.querySelectorAll(".nav a").forEach(function(a){ a.setAttribute("aria-current", a.getAttribute("data-tab") === t ? "page" : "false"); });
+    window.scrollTo(0, 0);
+  }
+  if (location.pathname !== "/") { history.replaceState(null, "", "/#" + start); show(start); }
+  else {
+    if (location.search) history.replaceState(null, "", "/" + location.hash); // убрать ?msg, чтобы не всплывало при обновлении
+    show(location.hash.slice(1) || start);
+  }
+  window.addEventListener("hashchange", function(){ show(location.hash.slice(1)); });
+  document.addEventListener("submit", function(e){
+    var b = e.submitter;
+    if (b && b.getAttribute("data-confirm") && !confirm(b.getAttribute("data-confirm"))) { e.preventDefault(); return; }
+    var form = e.target;
+    setTimeout(function(){
+      form.querySelectorAll("button").forEach(function(x){ x.disabled = true; });
+      if (b) b.textContent = "⏳ Подождите…";
+    }, 0);
+  });
+})();
+`;
+
+const ICONS = {
+  home: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/>',
+  analysis: '<path d="M3 21h18M6 17v-6M11 17V5M16 17v-9M21 17v-3"/>',
+  settings: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+  service: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+};
+const TAB_NAMES = { home: "Главная", analysis: "Анализ", settings: "Настройки", service: "Сервис" };
+
+function page(title, body, { tab = "home", status = 200, nav = true } = {}) {
+  const navHtml = nav
+    ? `<nav class="nav" aria-label="Разделы">${TABS.map((t) => `<a href="#${t}" data-tab="${t}"><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[t]}</svg>${TAB_NAMES[t]}</a>`).join("")}</nav><script>${CLIENT_JS}</script>`
+    : "";
   return new Response(
-    `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
-      + `<title>${esc(title)}</title><style>${CSS}</style></head><body><main>${body}</main></body></html>`,
-    { status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...headers } },
+    `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">`
+      + `<meta name="theme-color" content="#1f6feb"><title>${esc(title)}</title><style>${CSS}</style></head>`
+      + `<body data-tab="${esc(tab)}"><main>${body}</main>${navHtml}</body></html>`,
+    { status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } },
   );
 }
 
 function loginPage(error) {
   return page("MQM watch", `
-<header><h1>MQM watch</h1></header>
-${error ? `<div class="msg bad">${esc(error)}</div>` : ""}
-<section><form method="post" action="/login">
-<label>Пароль (RUN_KEY)<input type="password" name="key" autocomplete="current-password" autofocus></label>
-<p></p><button>Войти</button>
-</form></section>`, error ? 403 : 200);
+<div class="top"><h1>MQM watch</h1></div>
+${error ? `<div class="alert">${esc(error)}</div>` : ""}
+<form class="card" method="post" action="/login">
+<label>Пароль<input type="password" name="key" autocomplete="current-password" autofocus></label>
+<button class="btn primary">Войти</button>
+<p class="hint">Пароль — это секрет RUN_KEY в Cloudflare.</p>
+</form>`, { status: error ? 403 : 200, nav: false });
 }
 
 const checked = (v) => (v ? " checked" : "");
+const sel = (a, b) => (String(a) === String(b) ? " selected" : "");
 
-async function messagesSection(env, origin) {
-  const hook = env.WEBHOOK_SECRET ? `${origin}/webhook/${esc(env.WEBHOOK_SECRET)}` : null;
-  const rows = [
-    ["Firebase", !firebaseReady(env) ? `<span class="bad">не настроен</span>`
-      : env.FIREBASE_SECRET ? "вход по FIREBASE_SECRET" : "вход по FIREBASE_SERVICE_ACCOUNT"],
-    ["Адрес вебхука", hook ? `<code style="word-break:break-all">${hook}</code>` : `<span class="bad">нет секрета WEBHOOK_SECRET</span>`],
-  ];
-  const last = env.MQM_KV ? await env.MQM_KV.get("last_webhook", "json") : null;
-  rows.push(["Последний вебхук", !last ? `<span class="bad">ещё не приходил</span>`
-    : `${ago(last.time)} · ${last.ok ? `<span class="ok">OK</span>` : `<span class="bad">ошибка</span>`}<br><small>${esc(last.note)}</small>`]);
-  const c = config(env, await loadSettings(env));
-  try {
-    const st = (await apiCall(c, "getStateInstance"))?.stateInstance;
-    rows.push(["WhatsApp в Green API", st === "authorized" ? `<span class="ok">подключён</span>`
-      : `<span class="bad">${esc(st || "нет ответа")}</span> — откройте кабинет Green API`]);
-    const gs = await apiCall(c, "getSettings");
-    const want = env.WEBHOOK_SECRET ? `${origin}/webhook/${env.WEBHOOK_SECRET}` : null;
-    const flags = ["incomingWebhook", "outgoingWebhook", "outgoingAPIMessageWebhook"].filter((k) => gs?.[k] !== "yes");
-    let where;
-    if (!gs?.webhookUrl) where = `<span class="bad">не задан</span>`;
-    else if (gs.webhookUrl === want) where = `<span class="ok">наш адрес</span>`;
-    else {
-      let host = "";
-      try { host = new URL(gs.webhookUrl).host; } catch { host = "непонятный адрес"; }
-      where = `<span class="bad">другой адрес</span> (${esc(host)}${host === new URL(origin).host ? ", старый секрет" : ""})`;
-    }
-    rows.push(["Вебхук в Green API", where + (flags.length ? `<br><small class="bad">выключено: ${flags.join(", ")}</small>` : "")]);
-  } catch (e) {
-    rows.push(["Green API", `<span class="bad">${esc(e.message.slice(0, 200))}</span>`]);
-  }
-  let list = "";
-  if (firebaseReady(env)) {
-    try {
-      const chats = Object.values((await firebase(env, "GET", "/chats")) || {})
-        .sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0));
-      const total = chats.reduce((n, ch) => n + (ch.count || 0), 0);
-      rows.push(["Собрано", `${chats.length} чатов, ${total} сообщений`]);
-      list = chats.slice(0, 50).map((ch) => `<div class="row"><span>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}`
-        + `<br><small>${esc(ch.chatId)}</small></span><span>${ch.count || 0}<br><small>${ch.lastAt ? bakuTime(ch.lastAt * 1000) : ""}</small></span></div>`).join("");
-    } catch (e) {
-      rows.push(["Ошибка", `<span class="bad">${esc(e.message)}</span>`]);
-    }
-  }
-  return `<section><h2>Сообщения (Firebase)</h2>
-${rows.map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join("")}
-${list ? `<details><summary>Чаты</summary>${list}</details>` : ""}
-<form method="post" action="/action" class="btns" style="margin-top:10px">
-<button name="do" value="webhook" onclick="return confirm('Прописать адрес вебхука в Green API? Инстанс может перезапуститься на пару минут.')">🔗 Подключить вебхук в Green API</button>
-</form>
-</section>`;
+function toggleForm(key, on, label) {
+  return `<form method="post" action="/toggle"><input type="hidden" name="key" value="${key}"><input type="hidden" name="v" value="off">`
+    + `<label class="switch">${label}<input type="checkbox" name="v" value="on"${checked(on)} onchange="this.form.requestSubmit()" aria-label="${esc(label)}"></label></form>`;
 }
 
-async function dashboard(env, msg, result, origin, analysis = null) {
+function actionButton(tab, action, label, { cls = "", confirmText = "" } = {}) {
+  return `<form method="post" action="/action"><input type="hidden" name="tab" value="${tab}">`
+    + `<button class="btn ${cls}" name="do" value="${action}"${confirmText ? ` data-confirm="${esc(confirmText)}"` : ""}>${label}</button></form>`;
+}
+
+function resultCard(result) {
+  if (!result) return "";
+  return `<div class="toast${result.ok ? "" : " bad"}">${result.ok ? "✅ Готово" : "⚠️ Не получилось"}${result.summary ? ` — ${esc(result.summary)}` : ""}</div>`
+    + (result.log ? `<details class="card"${result.open ? " open" : ""}><summary>Подробности</summary><pre>${esc(result.log.slice(0, 50000))}</pre></details>` : "");
+}
+
+// Всё, что нужно странице, — одним заходом, параллельно.
+async function gatherStatus(env, origin) {
   const s = await loadSettings(env);
   const kv = env.MQM_KV;
-  const [last, state, weatherDate] = kv
-    ? await Promise.all([kv.get("last_run", "json"), kv.get("state", "json"), kv.get("weather_date")])
-    : [null, null, null];
+  const c = config(env, s);
+  const safe = (p) => p.then((v) => ({ v }), (e) => ({ e: e.message }));
+  const [last, state, weatherDate, lastHook, chats, gState, gSettings] = await Promise.all([
+    kv ? kv.get("last_run", "json") : null,
+    kv ? kv.get("state", "json") : null,
+    kv ? kv.get("weather_date") : null,
+    kv ? kv.get("last_webhook", "json") : null,
+    firebaseReady(env) ? safe(firebase(env, "GET", "/chats")) : { e: null },
+    safe(apiCall(c, "getStateInstance")),
+    safe(apiCall(c, "getSettings")),
+  ]);
+  const chatList = chats.v ? Object.values(chats.v || {}).sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0)) : [];
+  const want = env.WEBHOOK_SECRET ? `${origin}/webhook/${env.WEBHOOK_SECRET}` : null;
+  let hookWhere = null;
+  if (gSettings.v) {
+    const url = gSettings.v.webhookUrl;
+    hookWhere = !url ? "none" : url === want ? "ours" : "other";
+  }
+  return { s, kv, last, state, weatherDate, lastHook, chats, chatList, gState, gSettings, hookWhere };
+}
 
+function problems(env, st) {
+  const out = [];
+  if (!st.kv) out.push(["Не привязано хранилище KV", "Бот не может запоминать баллы и настройки."]);
+  if (/class="bad"/.test(secretsReport(env))) out.push(["Не хватает секретов", "Откройте «Сервис» — там видно, каких именно."]);
+  if (st.gState.v && st.gState.v.stateInstance !== "authorized") out.push(["WhatsApp отключён от Green API", "Откройте кабинет Green API и заново отсканируйте QR-код телефоном бота."]);
+  if (st.gState.e) out.push(["Green API не отвечает", st.gState.e.slice(0, 160)]);
+  if (st.hookWhere && st.hookWhere !== "ours") out.push(["Сообщения не собираются", "Green API шлёт их не туда. «Сервис» → «Подключить вебхук»."]);
+  if (st.lastHook && !st.lastHook.ok) out.push(["Последнее сообщение не сохранилось", st.lastHook.note]);
+  if (st.chats.e) out.push(["Firebase не отвечает", st.chats.e.slice(0, 160)]);
+  if (st.last && !st.last.ok) out.push(["Последний запуск с ошибкой", "Подробности — «Сервис» → «Лог последнего запуска»."]);
+  return out;
+}
+
+function homePanel(env, st, result) {
+  const { s, state, weatherDate, last, chatList, lastHook } = st;
   const tick = Math.floor(Date.now() / 60000);
   const next = (tick + (s.interval - (tick % s.interval))) * 60000;
   const today = ymd(bakuNow());
+  const probs = problems(env, st);
+  const total = chatList.reduce((n, ch) => n + (ch.count || 0), 0);
 
-  const statusRows = [
-    ["Бот", s.enabled ? `<span class="ok">включён</span>` : `<span class="bad">выключен</span>`],
-    ["Следующая проверка экзамена", s.enabled && s.exam_enabled ? `${bakuTime(next)} (каждые ${s.interval} мин)` : "—"],
-    ["Прогноз сегодня", !s.weather_enabled ? "выключен" : weatherDate === today ? "отправлен" : `ещё нет (в ${s.send_hour}:00)`],
-    ["Последний запуск", last
-      ? `${bakuTime(last.time)} · ${esc(last.source)} · ${last.ok ? `<span class="ok">OK</span>` : `<span class="bad">ошибка</span>`}`
-      : "ещё не было"],
-  ];
-  if (state) {
-    statusRows.push(["Сохранённые баллы", `${num(state.total)} / ${state.max}`]);
-    for (const [name, v] of Object.entries(norm(state.subjects))) {
-      statusRows.push([`• ${esc(name)}`, `${num(v.score)}`
-        + ("correct" in v ? ` (✅ ${v.correct} | ❌ ${v.wrong} | ⏳ ${v.unverified ?? 0})` : "")]);
-    }
-  } else {
-    statusRows.push(["Сохранённые баллы", "нет — следующая проверка запомнит текущие"]);
-  }
-  if (!kv) statusRows.unshift(["Внимание", `<span class="bad">не привязан KV namespace MQM_KV</span>`]);
-  const v = env.CF_VERSION_METADATA;
-  statusRows.push(["Версия воркера", v?.id
-    ? `${esc(v.id.slice(0, 8))}${v.timestamp ? ` · ${bakuTime(Date.parse(v.timestamp))}` : ""}`
-    : "неизвестно"]);
-  statusRows.push(["Секреты, которые видит воркер", secretsReport(env)]);
+  const scores = state
+    ? `<div class="big">${num(state.total)} <small>/ ${state.max}</small></div><div class="subj">`
+      + Object.entries(norm(state.subjects)).map(([n, v]) => `<div><span>${esc(n)}</span><span>${num(v.score)}${"correct" in v ? ` · ✅${v.correct} ❌${v.wrong} ⏳${v.unverified ?? 0}` : ""}</span></div>`).join("")
+      + `</div>`
+    : `<p class="meta">Баллы ещё не сохранены — следующая проверка их запомнит.</p>`;
 
-  return page("MQM watch", `
-<header><h1>MQM watch</h1><a href="/logout">Выйти</a></header>
-${msg ? `<div class="msg">${msg}</div>` : ""}
-${analysis ? `<section><h2>Анализ</h2>${analysis.ok ? "" : `<div class="bad">Ошибка</div>`}${analysis.html}</section>` : ""}
-${result ? `<section><h2>Результат</h2><div class="${result.ok ? "ok" : "bad"}">${result.ok ? "Готово" : "Ошибка"}</div><pre>${esc(result.log.slice(0, 50000))}</pre></section>` : ""}
+  return `${resultCard(result)}
+${probs.map(([t, d]) => `<div class="alert" role="alert"><b>⚠️ ${esc(t)}</b>${esc(d)}</div>`).join("")}
 
-<section><h2>Статус</h2>
-${statusRows.map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join("")}
-${last ? `<details><summary>Лог последнего запуска</summary><pre>${esc(last.log)}</pre></details>` : ""}
+<section class="card">
+${toggleForm("enabled", s.enabled, `<b>Бот ${s.enabled ? "работает" : "выключен"}</b>`)}
+<p class="meta">${last ? `Последний запуск: ${bakuTime(last.time)} · ${esc(last.source)} · ${last.ok ? `<span class="ok">без ошибок</span>` : `<span class="bad">ошибка</span>`}` : "Ещё не запускался."}${s.enabled ? "" : " Пока выключен, по расписанию ничего не делает; кнопки работают."}</p>
 </section>
 
-${await messagesSection(env, origin)}
-
-${await analysisSection(env, analysis?.a)}
-
-<form method="post" action="/save">
-<section><h2>Общее</h2>
-<label class="sw"><input type="checkbox" name="enabled"${checked(s.enabled)}> Бот включён</label>
-<p class="hint">Выключено — по расписанию ничего не происходит. Кнопки ниже работают всегда.</p>
+<section class="card">
+<h2>📊 Экзамен</h2>
+${toggleForm("exam_enabled", s.exam_enabled, "Следить за баллами")}
+${scores}
+<p class="meta">${s.enabled && s.exam_enabled ? `Проверка ${intervalLabel(s.interval)} · следующая в ${hm(new Date(next + BAKU_OFFSET_MS))}` : "Автопроверка выключена"}</p>
+<div class="btns two">
+${actionButton("home", "exam", "🔄 Проверить", { cls: "primary" })}
+${actionButton("home", "test", "✅ Тест в группу", { confirmText: "Отправить тестовое сообщение с баллами в группу?" })}
+</div>
 </section>
 
-<section><h2>Экзамен</h2>
-<label class="sw"><input type="checkbox" name="exam_enabled"${checked(s.exam_enabled)}> Проверять баллы</label>
-<label>Как часто проверять, минут (от ${MIN_INTERVAL} до 1440)<input type="number" name="interval" min="${MIN_INTERVAL}" max="1440" value="${esc(s.interval)}"></label>
-<label>Ссылка на результат<input type="url" name="url" value="${esc(s.url)}"></label>
+<section class="card">
+<h2>🌦 Погода</h2>
+${toggleForm("weather_enabled", s.weather_enabled, "Утренний прогноз в группу")}
+<p class="meta">${esc(s.place)} · в ${pad(s.send_hour)}:00 · сегодня ${weatherDate === today ? `<span class="ok">отправлен</span>` : "ещё не отправлен"}</p>
+${actionButton("home", "weather", "🌦 Прислать прогноз сейчас", { confirmText: "Отправить прогноз погоды в группу сейчас?" })}
+</section>
+
+<section class="card">
+<h2>💬 Сообщения</h2>
+<p class="meta">${firebaseReady(env) ? `Собрано ${chatList.length} чатов, ${total} сообщений.` : "Сбор не настроен — см. «Сервис»."}
+${lastHook ? ` Последнее: ${ago(lastHook.time)} ${lastHook.ok ? `<span class="ok">✓</span>` : `<span class="bad">с ошибкой</span>`}.` : ""}</p>
+<a class="btn" href="#analysis">📈 Открыть анализ</a>
+</section>`;
+}
+
+function analysisPanel(env, st, analysis) {
+  const { s, chatList } = st;
+  const a = analysis?.a || {};
+  const hours = a.hours || 24;
+  const lang = a.lang || s.gemini_lang;
+  const res = analysis
+    ? `<section class="card">${analysis.ok ? "" : `<div class="toast bad">⚠️ Не получилось</div>`}${analysis.html}</section>`
+    : "";
+  if (!firebaseReady(env)) return res + `<section class="card"><h2>Анализ переписки</h2><p class="meta">Сначала нужно настроить сбор сообщений в Firebase — см. «Сервис».</p></section>`;
+  if (!chatList.length) return res + `<section class="card"><h2>Анализ переписки</h2><p class="meta">Пока нет собранных чатов. Напишите что-нибудь в группу.</p></section>`;
+  return `${res}
+<form class="card" method="post" action="/analyze">
+<h2>Анализ переписки</h2>
+<label>Чат<select name="chat">${chatList.map((ch) => `<option value="${esc(ch.chatId)}"${sel(ch.chatId, a.chat)}>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)} · ${ch.count || 0}</option>`).join("")}</select></label>
+<div><div class="meta" style="margin-bottom:4px">Период</div><div class="seg">${Object.entries(PERIODS).map(([h, l]) => `<label><input type="radio" name="period" value="${h}"${checked(Number(h) === hours)}><span>${l}</span></label>`).join("")}</div></div>
+<button class="btn primary" name="do" value="stats">📊 Показать статистику</button>
+<h3>Gemini</h3>
+<label>Язык ответа<select name="lang">${Object.entries(LANGS).map(([k, [n]]) => `<option value="${k}"${sel(k, lang)}>${n}</option>`).join("")}</select></label>
+<div class="btns two">
+<button class="btn" name="do" value="summary">🤖 Разбор</button>
+<button class="btn" name="do" value="ask">❓ Спросить</button>
+</div>
+<label>Вопрос для «Спросить»<textarea name="question" rows="2" placeholder="Например: что решили про субботу?">${esc(a.question || "")}</textarea></label>
+${env.GEMINI_API_KEY ? "" : `<p class="hint bad">Для «Разбора» и «Спросить» добавьте секрет GEMINI_API_KEY. Статистика работает без него.</p>`}
+<p class="hint">В группы ничего не отправляется. Переписка уходит в Gemini только по кнопкам 🤖 и ❓.</p>
+</form>`;
+}
+
+function settingsPanel(st) {
+  const { s } = st;
+  const intervals = INTERVALS.includes(s.interval) ? INTERVALS : [...INTERVALS, s.interval].sort((x, y) => x - y);
+  return `<form method="post" action="/save" class="panel">
+<section class="card">
+<h2>📊 Экзамен</h2>
+<label>Как часто проверять<select name="interval">${intervals.map((m) => `<option value="${m}"${sel(m, s.interval)}>${intervalLabel(m)}</option>`).join("")}</select></label>
+<label>Ссылка на результат<input type="url" name="url" value="${esc(s.url)}" autocapitalize="off" spellcheck="false"></label>
 <label>Имя в сообщении<input type="text" name="title" value="${esc(s.title)}"></label>
+<details><summary>Дополнительно</summary><div class="adv">
 <label>Предметы через запятую — точно как на сайте<input type="text" name="subjects" value="${esc(s.subjects)}"></label>
-<p class="hint">При смене ссылки или предметов сохранённые баллы сбрасываются: следующая проверка запомнит новые без сообщения.</p>
+<p class="hint">При смене ссылки или предметов сохранённые баллы сбрасываются, чтобы не пришло ложное «баллы изменились».</p>
+</div></details>
 </section>
 
-<section><h2>Погода</h2>
-<label class="sw"><input type="checkbox" name="weather_enabled"${checked(s.weather_enabled)}> Утренний прогноз</label>
+<section class="card">
+<h2>🌦 Погода</h2>
 <label>Место (как в сообщении)<input type="text" name="place" value="${esc(s.place)}"></label>
 <div class="grid2">
+<label>Время отправки<select name="send_hour">${Array.from({ length: 24 }, (_, h) => `<option value="${h}"${sel(h, s.send_hour)}>${pad(h)}:00</option>`).join("")}</select></label>
+<label>На сколько часов<select name="hours">${[6, 12, 18, 24].map((h) => `<option value="${h}"${sel(h, s.hours)}>${h} ч</option>`).join("")}${[6, 12, 18, 24].includes(s.hours) ? "" : `<option value="${s.hours}" selected>${s.hours} ч</option>`}</select></label>
+</div>
+<input type="hidden" name="clean_enabled" value="off">
+<label class="switch">Перед прогнозом удалять вчерашние сообщения бота<input type="checkbox" name="clean_enabled" value="on"${checked(s.clean_enabled)}></label>
+<details><summary>Дополнительно</summary><div class="adv grid2">
 <label>Широта<input type="text" inputmode="decimal" name="lat" value="${esc(s.lat)}"></label>
 <label>Долгота<input type="text" inputmode="decimal" name="lon" value="${esc(s.lon)}"></label>
-<label>Час отправки (Баку)<input type="number" name="send_hour" min="0" max="23" value="${esc(s.send_hour)}"></label>
-<label>Часов вперёд<input type="number" name="hours" min="1" max="24" value="${esc(s.hours)}"></label>
-</div>
-<label class="sw" style="margin-top:14px"><input type="checkbox" name="clean_enabled"${checked(s.clean_enabled)}> Перед прогнозом удалять вчерашние сообщения бота</label>
+</div></details>
 </section>
 
-<section><h2>Gemini</h2>
+<section class="card">
+<h2>🤖 Gemini</h2>
+<label>Язык ответа по умолчанию<select name="gemini_lang">${Object.entries(LANGS).map(([k, [n]]) => `<option value="${k}"${sel(k, s.gemini_lang)}>${n}</option>`).join("")}</select></label>
+<details><summary>Дополнительно</summary><div class="adv">
 <label>Модель<input type="text" name="gemini_model" value="${esc(s.gemini_model)}" autocapitalize="off" spellcheck="false"></label>
-<p class="hint">По умолчанию gemini-flash-latest — всегда свежая быстрая модель. Ключ — секрет GEMINI_API_KEY в Cloudflare.</p>
+<p class="hint">gemini-flash-latest — всегда свежая быстрая модель. При перегрузке бот сам переходит на ${GEMINI_FALLBACK}.</p>
+</div></details>
 </section>
 
-<button>Сохранить настройки</button>
-</form>
+<div class="savebar"><button class="btn primary">💾 Сохранить настройки</button></div>
+</form>`;
+}
 
-<p></p>
-<section><h2>Действия</h2>
-<form method="post" action="/action" class="btns">
-<button name="do" value="exam">🔄 Проверить экзамен сейчас</button>
-<button name="do" value="test">✅ Тестовое сообщение с баллами в группу</button>
-<button name="do" value="weather">🌦 Прислать прогноз сейчас</button>
-<button name="do" value="dump">🔍 Показать, что бот видит на странице экзамена</button>
-<button name="do" value="clean" class="danger" onclick="return confirm('Удалить у всех старые сообщения бота?')">🧹 Удалить старые сообщения бота</button>
-<button name="do" value="reset" class="danger" onclick="return confirm('Сбросить сохранённые баллы?')">↺ Сбросить сохранённые баллы</button>
-</form>
+function servicePanel(env, st, origin, result) {
+  const { last, lastHook, gState, gSettings, hookWhere, chatList, chats } = st;
+  const v = env.CF_VERSION_METADATA;
+  const flags = gSettings.v ? ["incomingWebhook", "outgoingWebhook", "outgoingAPIMessageWebhook"].filter((k) => gSettings.v[k] !== "yes") : [];
+  const rows = [
+    ["Версия бота", v?.id ? `${esc(v.id.slice(0, 8))}${v.timestamp ? ` · ${bakuTime(Date.parse(v.timestamp))}` : ""}` : "неизвестно"],
+    ["Секреты", secretsReport(env)],
+    ["WhatsApp", gState.v ? (gState.v.stateInstance === "authorized" ? `<span class="ok">подключён</span>` : `<span class="bad">${esc(gState.v.stateInstance)}</span>`) : `<span class="bad">нет ответа</span>`],
+    ["Вебхук в Green API", hookWhere === "ours" ? `<span class="ok">настроен</span>` : hookWhere === "other" ? `<span class="bad">другой адрес</span>` : hookWhere === "none" ? `<span class="bad">не задан</span>` : "—"],
+    ["Последнее сообщение", lastHook ? `${ago(lastHook.time)} · ${lastHook.ok ? `<span class="ok">сохранено</span>` : `<span class="bad">ошибка</span><br><small>${esc(lastHook.note)}</small>`}` : "ещё не приходило"],
+    ["Firebase", !firebaseReady(env) ? `<span class="bad">не настроен</span>` : chats.e ? `<span class="bad">ошибка</span>` : `<span class="ok">работает</span> · ${env.FIREBASE_SECRET ? "секрет базы" : "сервисный аккаунт"}`],
+  ];
+  if (flags.length) rows.push(["Выключено в Green API", `<span class="bad">${flags.join(", ")}</span>`]);
+  const hook = env.WEBHOOK_SECRET ? `${origin}/webhook/${env.WEBHOOK_SECRET}` : null;
+  return `${resultCard(result)}
+<section class="card">
+<h2>Проверка подключений</h2>
+<div>${rows.map(([k, val]) => `<div class="row"><span>${k}</span><span>${val}</span></div>`).join("")}</div>
+${hook ? `<details><summary>Адрес вебхука</summary><code>${esc(hook)}</code></details>` : ""}
+${actionButton("service", "webhook", "🔗 Подключить вебхук в Green API", { confirmText: "Прописать адрес вебхука в Green API? Инстанс может перезапуститься на пару минут." })}
 </section>
-<p class="hint">Cron Trigger в Cloudflare должен быть <code>* * * * *</code> (каждую минуту) — частоту проверок задаёт настройка выше.</p>
-`);
+
+<section class="card">
+<h2>Действия</h2>
+<div class="btns">
+${actionButton("service", "dump", "🔍 Что бот видит на странице экзамена")}
+${actionButton("service", "clean", "🧹 Удалить старые сообщения бота", { cls: "danger", confirmText: "Удалить у всех старые сообщения бота в группе?" })}
+${actionButton("service", "reset", "↺ Сбросить сохранённые баллы", { cls: "danger", confirmText: "Сбросить сохранённые баллы? Следующая проверка запомнит текущие без сообщения." })}
+</div>
+</section>
+
+${last ? `<details class="card"><summary>Лог последнего запуска · ${bakuTime(last.time)}</summary><pre>${esc(last.log)}</pre></details>` : ""}
+${chatList.length ? `<details class="card"><summary>Собранные чаты (${chatList.length})</summary>${chatList.map((ch) => `<div class="chat"><span>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}<br><small>${esc(ch.chatId)}</small></span><span>${ch.count || 0}<br><small>${ch.lastAt ? bakuTime(ch.lastAt * 1000) : ""}</small></span></div>`).join("")}</details>` : ""}
+<p class="hint">Расписание в Cloudflare — <code>* * * * *</code> (каждую минуту); как часто проверять экзамен, задаётся в «Настройках».</p>`;
+}
+
+async function dashboard(env, origin, { tab = "home", msg = null, result = null, analysis = null } = {}) {
+  const st = await gatherStatus(env, origin);
+  const toast = msg ? `<div class="toast${msg.bad ? " bad" : ""}">${esc(msg.text)}</div>` : "";
+  return page("MQM watch", `
+<div class="top"><h1>MQM watch</h1><a href="/logout">Выйти</a></div>
+${toast}
+<div class="panel" id="p-home">${homePanel(env, st, tab === "home" ? result : null)}</div>
+<div class="panel" id="p-analysis">${analysisPanel(env, st, analysis)}</div>
+<div class="panel" id="p-settings">${settingsPanel(st)}</div>
+<div class="panel" id="p-service">${servicePanel(env, st, origin, tab === "service" ? result : null)}</div>`, { tab });
 }
 
 async function saveSettings(request, env) {
@@ -1090,32 +1225,54 @@ async function saveSettings(request, env) {
   if (!u || u.protocol !== "https:") throw new Error("Ссылка на результат должна начинаться с https://");
   const subjects = str("subjects").split(",").map((x) => x.trim()).filter(Boolean).join(", ");
   if (!subjects) throw new Error("Укажите хотя бы один предмет");
+  const model = str("gemini_model") || "gemini-flash-latest";
+  if (!/^[a-z0-9][a-z0-9.-]{1,60}$/.test(model)) throw new Error("Модель Gemini: только латинские буквы, цифры, точка и дефис, например gemini-flash-latest");
+  const lang = str("gemini_lang");
 
+  // включатели бота, экзамена и погоды живут на «Главной» — здесь их не трогаем
   const s = {
-    enabled: f.get("enabled") === "on",
-    exam_enabled: f.get("exam_enabled") === "on",
+    ...old,
     interval: int("interval", MIN_INTERVAL, 1440, "Частота проверки"),
     url,
     title: str("title") || "Asim Qaraxanov",
     subjects,
-    weather_enabled: f.get("weather_enabled") === "on",
     place: str("place") || "Pirşağı",
     lat: coord("lat", 90, "Широта"),
     lon: coord("lon", 180, "Долгота"),
-    send_hour: int("send_hour", 0, 23, "Час отправки"),
-    hours: int("hours", 1, 24, "Часов вперёд"),
-    clean_enabled: f.get("clean_enabled") === "on",
-    gemini_model: (() => {
-      const m = str("gemini_model") || "gemini-flash-latest";
-      if (!/^[a-z0-9][a-z0-9.-]{1,60}$/.test(m)) throw new Error("Модель Gemini: только латинские буквы, цифры, точка и дефис, например gemini-flash-latest");
-      return m;
-    })(),
+    send_hour: int("send_hour", 0, 23, "Время отправки"),
+    hours: int("hours", 1, 24, "На сколько часов"),
+    clean_enabled: f.getAll("clean_enabled").includes("on"),
+    gemini_model: model,
+    gemini_lang: LANGS[lang] ? lang : old.gemini_lang,
   };
   await env.MQM_KV.put("settings", JSON.stringify(s));
   const reset = s.url !== old.url || s.subjects !== old.subjects;
   if (reset) await env.MQM_KV.delete("state");
-  return reset ? "Сохранено. Ссылка или предметы изменились — сохранённые баллы сброшены." : "Сохранено.";
+  return reset ? "Сохранено. Ссылка или предметы изменились — сохранённые баллы сброшены." : "Настройки сохранены.";
 }
+
+const TOGGLES = {
+  enabled: ["Бот включён", "Бот выключен"],
+  exam_enabled: ["Слежение за баллами включено", "Слежение за баллами выключено"],
+  weather_enabled: ["Утренний прогноз включён", "Утренний прогноз выключен"],
+};
+
+async function toggleSetting(request, env) {
+  const f = await request.formData();
+  const key = String(f.get("key") || "");
+  if (!TOGGLES[key]) throw new Error("Неизвестный переключатель");
+  const on = f.getAll("v").includes("on");
+  await env.MQM_KV.put("settings", JSON.stringify({ ...(await loadSettings(env)), [key]: on }));
+  return TOGGLES[key][on ? 0 : 1];
+}
+
+const ACTION_SUMMARY = {
+  exam: "баллы проверены",
+  test: "тестовое сообщение отправлено в группу",
+  weather: "прогноз отправлен в группу",
+  dump: "ниже текст страницы экзамена и что из него понял бот",
+  clean: "старые сообщения бота удалены",
+};
 
 async function doAction(env, action, origin) {
   const s = await loadSettings(env);
@@ -1129,17 +1286,18 @@ async function doAction(env, action, origin) {
   }[action];
   if (action === "webhook") {
     try {
-      return { ok: true, log: await connectWebhook(env, origin) };
+      return { ok: true, summary: "адрес прописан, Green API может пару минут перезапускаться", log: await connectWebhook(env, origin) };
     } catch (e) {
-      return { ok: false, log: e.message };
+      return { ok: false, summary: e.message };
     }
   }
   if (action === "reset") {
     await env.MQM_KV.delete("state");
-    return { ok: true, log: "Сохранённые баллы сброшены. Следующая проверка запомнит текущие без сообщения." };
+    return { ok: true, summary: "сохранённые баллы сброшены; следующая проверка запомнит текущие без сообщения" };
   }
-  if (!opts) return { ok: false, log: "Неизвестное действие" };
-  return run(env, s, { ...base, ...opts }, "вручную");
+  if (!opts) return { ok: false, summary: "неизвестное действие" };
+  const res = await run(env, s, { ...base, ...opts }, "вручную");
+  return { ...res, summary: res.ok ? ACTION_SUMMARY[action] : "см. подробности", open: action === "dump" || !res.ok };
 }
 
 function flag(params, name, def) {
@@ -1226,15 +1384,26 @@ export default {
       });
     }
 
-    if (!["/", "/save", "/action", "/analyze"].includes(path)) return new Response("Not found", { status: 404 });
+    if (!["/", "/save", "/toggle", "/action", "/analyze"].includes(path)) return new Response("Not found", { status: 404 });
     if (!(await isAuthed(request, env))) return loginPage();
+    const back = (tab, text, bad = false) => new Response(null, {
+      status: 303,
+      headers: { Location: `/?msg=${encodeURIComponent(text)}${bad ? "&bad=1" : ""}#${tab}` },
+    });
 
     if (path === "/save" && request.method === "POST") {
       try {
-        const msg = await saveSettings(request, env);
-        return new Response(null, { status: 303, headers: { Location: "/?msg=" + encodeURIComponent(msg) } });
+        return back("settings", await saveSettings(request, env));
       } catch (e) {
-        return dashboard(env, `<span class="bad">Не сохранено: ${esc(e.message)}</span>`, null, url.origin);
+        return dashboard(env, url.origin, { tab: "settings", msg: { text: `Не сохранено: ${e.message}`, bad: true } });
+      }
+    }
+
+    if (path === "/toggle" && request.method === "POST") {
+      try {
+        return back("home", await toggleSetting(request, env));
+      } catch (e) {
+        return back("home", e.message, true);
       }
     }
 
@@ -1244,17 +1413,22 @@ export default {
       try {
         res = await analyze(env, form);
       } catch (e) {
-        res = { a: { chat: String(form.get("chat") || ""), hours: Number(form.get("period")) || 24, question: String(form.get("question") || "") }, ok: false, html: esc(e.message) };
+        res = {
+          a: { chat: String(form.get("chat") || ""), hours: Number(form.get("period")) || 24, question: String(form.get("question") || ""), lang: String(form.get("lang") || "") },
+          ok: false,
+          html: `<p>${esc(e.message)}</p>`,
+        };
       }
-      return dashboard(env, null, null, url.origin, res);
+      return dashboard(env, url.origin, { tab: "analysis", analysis: res });
     }
 
     if (path === "/action" && request.method === "POST") {
-      const action = String((await request.formData()).get("do") || "");
-      return dashboard(env, null, await doAction(env, action, url.origin), url.origin);
+      const form = await request.formData();
+      const tab = TABS.includes(String(form.get("tab"))) ? String(form.get("tab")) : "home";
+      return dashboard(env, url.origin, { tab, result: await doAction(env, String(form.get("do") || ""), url.origin) });
     }
 
-    const msg = url.searchParams.get("msg");
-    return dashboard(env, msg ? esc(msg) : null, null, url.origin);
+    const text = url.searchParams.get("msg");
+    return dashboard(env, url.origin, { msg: text ? { text, bad: url.searchParams.get("bad") === "1" } : null });
   },
 };
