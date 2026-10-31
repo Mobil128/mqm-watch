@@ -32,7 +32,7 @@ const COUNTERS = {
 
 // Уборка трогает только свои исходящие сообщения с этими значками.
 const SCORE_PREFIX = "📊";
-const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test", "🔌"];
+const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test", "🔌", "📅"];
 // Бесплатный план Cloudflare: не больше 50 внешних запросов за запуск.
 const MAX_DELETES = 40;
 // Бесплатный план KV: 1000 записей в сутки; каждая проверка пишет лог запуска.
@@ -79,6 +79,11 @@ function defaults(env) {
     camera_forward: false,
     camera_chat: "",
     camera_cooldown: 5,
+    cal_enabled: false,
+    cal_urls: "",
+    cal_holidays: "",
+    cal_hour: 8,
+    cal_tomorrow: true,
   };
 }
 
@@ -465,6 +470,112 @@ async function sendForecast(c, force, now, today) {
   if (cleanError) throw cleanError;
 }
 
+// ---------------- Календарь: дни рождения и праздники ----------------
+// Источники — ссылки iCal: секретный адрес своего календаря Google и публичный календарь праздников.
+// Берём только события «на весь день», чтобы встречи со временем не попали в группу.
+
+const HOLIDAY_LANGS = { az: "Azərbaycanca", ru: "Русский", en: "English" };
+const holidayUrl = (lang) => `https://calendar.google.com/calendar/ical/${lang}.az%23holiday%40group.v.calendar.google.com/public/basic.ics`;
+const AZ_MONTHS = ["yanvar", "fevral", "mart", "aprel", "may", "iyun", "iyul", "avqust", "sentyabr", "oktyabr", "noyabr", "dekabr"];
+const BIRTHDAY_RE = /ad g[üu]n|do[ğg]um g[üu]n|birthday|день рожд/i;
+
+function calendarSources(s) {
+  const own = String(s.cal_urls || "").split(/\s+/).filter(Boolean).map((u) => ({ url: u.replace(/^webcal:\/\//i, "https://"), holiday: false }));
+  return s.cal_holidays && HOLIDAY_LANGS[s.cal_holidays] ? [...own, { url: holidayUrl(s.cal_holidays), holiday: true }] : own;
+}
+
+const icsText = (v) => v.replace(/\\n/gi, " ").replace(/\\([,;\\])/g, "$1").trim();
+
+function parseIcs(text) {
+  const lines = text.replace(/\r?\n[ \t]/g, "").split(/\r?\n/);
+  const events = [];
+  let ev = null;
+  for (const line of lines) {
+    if (line === "BEGIN:VEVENT") ev = {};
+    else if (line === "END:VEVENT") { if (ev) events.push(ev); ev = null; }
+    else if (ev) {
+      const i = line.indexOf(":");
+      if (i < 0) continue;
+      const [name, ...params] = line.slice(0, i).split(";");
+      const value = line.slice(i + 1).trim();
+      if (name === "SUMMARY") ev.summary = icsText(value);
+      else if (name === "UID") ev.uid = value;
+      else if (name === "STATUS") ev.status = value;
+      else if (name === "DTSTART") { ev.allDay = params.includes("VALUE=DATE") || /^\d{8}$/.test(value); ev.start = value.slice(0, 8); }
+      else if (name === "DTEND") ev.end = value.slice(0, 8);
+      else if (name === "RRULE") ev.rrule = Object.fromEntries(value.split(";").map((x) => x.split("=")));
+      else if (name === "EXDATE") (ev.exdates ||= []).push(...value.split(",").map((x) => x.slice(0, 8)));
+      else if (name === "RECURRENCE-ID") ev.recurrenceId = value.slice(0, 8);
+    }
+  }
+  return events;
+}
+
+// day — "YYYYMMDD" по Баку. Поддержаны разовые (в т.ч. многодневные), ежегодные и ежемесячные события.
+function eventsOn(events, day) {
+  const moved = new Set(events.filter((e) => e.recurrenceId).map((e) => `${e.uid}|${e.recurrenceId}`));
+  return events.filter((e) => {
+    if (!e.allDay || !e.start || e.status === "CANCELLED" || e.exdates?.includes(day)) return false;
+    const r = e.rrule;
+    if (!r || e.recurrenceId) return day === e.start || (e.end && day > e.start && day < e.end);
+    if (day < e.start || moved.has(`${e.uid}|${day}`)) return false;
+    if (r.UNTIL && day > r.UNTIL.slice(0, 8)) return false;
+    const step = Number(r.INTERVAL || 1);
+    const years = Number(day.slice(0, 4)) - Number(e.start.slice(0, 4));
+    if (r.FREQ === "YEARLY") return day.slice(4) === e.start.slice(4) && years % step === 0;
+    if (r.FREQ === "MONTHLY") return day.slice(6) === e.start.slice(6) && (years * 12 + Number(day.slice(4, 6)) - Number(e.start.slice(4, 6))) % step === 0;
+    return false;
+  });
+}
+
+async function calendarMessage(c, now) {
+  const today = ymd(now).replace(/-/g, "");
+  const tomorrow = ymd(addHours(now, 24)).replace(/-/g, "");
+  const pick = { today: [], tomorrow: [] };
+  const errors = [];
+  for (const src of calendarSources(c.s)) {
+    try {
+      const res = await fetch(src.url, { headers: { "User-Agent": "Mozilla/5.0" } });
+      if (!res.ok) throw new Error(`ответ ${res.status}`);
+      const events = parseIcs(await res.text());
+      const line = (e) => `${src.holiday ? "🎉" : BIRTHDAY_RE.test(e.summary || "") ? "🎂" : "📌"} ${e.summary || "(без названия)"}`;
+      pick.today.push(...eventsOn(events, today).map(line));
+      if (c.s.cal_tomorrow) pick.tomorrow.push(...eventsOn(events, tomorrow).map(line));
+    } catch (e) {
+      errors.push(`${new URL(src.url).host}: ${e.message}`);
+    }
+  }
+  const uniq = (a) => [...new Set(a)];
+  const todayList = uniq(pick.today), tomorrowList = uniq(pick.tomorrow).filter((x) => !todayList.includes(x));
+  if (errors.length && !todayList.length && !tomorrowList.length) throw new Error(`Календарь не открылся: ${errors.join("; ")}`);
+  errors.forEach((e) => c.log("Календарь:", e));
+  if (!todayList.length && !tomorrowList.length) return null;
+  const lines = [`📅 ${now.getUTCDate()} ${AZ_MONTHS[now.getUTCMonth()]}, ${WEEKDAYS[(now.getUTCDay() + 6) % 7]}`];
+  if (todayList.length) lines.push(...todayList);
+  if (tomorrowList.length) lines.push("", "Sabah:", ...tomorrowList);
+  return lines.join("\n");
+}
+
+// Раз в день после часа отправки (по Баку). force — «отправить сейчас»: без учёта часа и даты.
+async function dailyCalendar(c, force) {
+  const now = bakuNow();
+  const today = ymd(now);
+  if (!force) {
+    if (now.getUTCHours() < c.s.cal_hour || (await c.kv.get("cal_date")) === today) return;
+    if (Date.now() < (Number(await c.kv.get("cal_retry_at")) || 0)) return;
+  }
+  c.acted = true;
+  try {
+    const msg = await calendarMessage(c, now);
+    if (msg) await send(c, msg);
+    else c.log("Календарь: сегодня и завтра событий нет — ничего не отправлено");
+    if (!force) await c.kv.put("cal_date", today);
+  } catch (e) {
+    if (!force) await c.kv.put("cal_retry_at", String(Date.now() + 30 * 60000), { expirationTtl: 7200 });
+    throw e;
+  }
+}
+
 // ---------------- Запуск ----------------
 
 async function run(env, s, opts, source) {
@@ -480,6 +591,7 @@ async function run(env, s, opts, source) {
   else {
     if (opts.exam) steps.push(["Экзамен", () => checkResults(c, opts)]);
     if (opts.weather) steps.push(["Погода", () => dailyWeather(c, opts.test)]);
+    if (opts.calendar) steps.push(["Календарь", () => dailyCalendar(c, opts.test)]);
   }
   if (!steps.length) c.log("Нечего делать: экзамен и погода не выбраны");
   // баллы и погода независимы: сбой одного не мешает другому
@@ -1719,10 +1831,11 @@ async function gatherStatus(env, origin) {
   const kv = env.MQM_KV;
   const c = config(env, s);
   const safe = (p) => p.then((v) => ({ v }), (e) => ({ e: e.message }));
-  const [last, state, weatherDate, lastHook, chats, gState, gSettings, orders] = await Promise.all([
+  const [last, state, weatherDate, calDate, lastHook, chats, gState, gSettings, orders] = await Promise.all([
     kv ? kv.get("last_run", "json") : null,
     kv ? kv.get("state", "json") : null,
     kv ? kv.get("weather_date") : null,
+    kv ? kv.get("cal_date") : null,
     kv ? kv.get("last_webhook", "json") : null,
     firebaseReady(env) ? safe(firebase(env, "GET", "/chats")) : { e: null },
     safe(apiCall(c, "getStateInstance")),
@@ -1740,7 +1853,7 @@ async function gatherStatus(env, origin) {
   const house = await houseStatus(env, s);
   const camToken = await cameraToken(env);
   const cameraUrl = camToken ? `${origin}/camera/${camToken}` : null;
-  return { s, kv, last, state, weatherDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl };
+  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl };
 }
 
 function problems(env, st) {
@@ -1798,6 +1911,8 @@ ${toggleForm("weather_enabled", s.weather_enabled, "Утренний прогн�
 ${actionButton("home", "weather", "🌦 Прислать прогноз сейчас", { confirmText: "Отправить прогноз погоды в группу сейчас?" })}
 </section>
 
+${calendarCard(st)}
+
 ${ordersCard(st)}
 
 <section class="card">
@@ -1805,6 +1920,20 @@ ${ordersCard(st)}
 <p class="meta">${firebaseReady(env) ? `Собрано ${chatList.length} чатов, ${total} сообщений.` : "Сбор не настроен — см. «Сервис»."}
 ${lastHook ? ` Последнее: ${ago(lastHook.time)} ${lastHook.ok ? `<span class="ok">✓</span>` : `<span class="bad">с ошибкой</span>`}.` : ""}</p>
 <a class="btn" href="#analysis">📈 Открыть анализ</a>
+</section>`;
+}
+
+function calendarCard(st) {
+  const { s } = st;
+  const n = calendarSources(s).length;
+  return `<section class="card">
+<h2>📅 Календарь</h2>
+${toggleForm("cal_enabled", s.cal_enabled, "Дни рождения и праздники в группу")}
+<p class="meta">${n ? `Календарей: ${n} · каждый день в ${pad(s.cal_hour)}:00 · сегодня ${st.calDate === ymd(bakuNow()) ? `<span class="ok">проверено</span>` : "ещё нет"}` : `Добавьте календарь в «Настройках» → «📅 Календарь».`}</p>
+${n ? `<div class="btns two">
+${actionButton("home", "calendar_preview", "👀 Что уйдёт")}
+${actionButton("home", "calendar", "📤 Отправить", { confirmText: "Отправить дни рождения и праздники в группу сейчас?" })}
+</div>` : ""}
 </section>`;
 }
 
@@ -1941,6 +2070,26 @@ function settingsPanel(st) {
 </section>
 
 <section class="card">
+<h2>📅 Календарь</h2>
+<label>Праздники Азербайджана<select name="cal_holidays"><option value=""${sel("", s.cal_holidays)}>не добавлять</option>${Object.entries(HOLIDAY_LANGS).map(([k, n]) => `<option value="${k}"${sel(k, s.cal_holidays)}>${n}</option>`).join("")}</select></label>
+<label>Мои календари — «секретный адрес в формате iCal», по одному в строке<textarea name="cal_urls" rows="3" autocapitalize="off" spellcheck="false" placeholder="https://calendar.google.com/calendar/ical/…/private-…/basic.ics">${esc(s.cal_urls)}</textarea></label>
+<div class="grid2">
+<label>Время отправки<select name="cal_hour">${Array.from({ length: 24 }, (_, h) => `<option value="${h}"${sel(h, s.cal_hour)}>${pad(h)}:00</option>`).join("")}</select></label>
+<div></div>
+</div>
+<input type="hidden" name="cal_tomorrow" value="off">
+<label class="switch">Предупреждать и о завтрашних<input type="checkbox" name="cal_tomorrow" value="on"${checked(s.cal_tomorrow)}></label>
+<details><summary>Где взять секретный адрес</summary><ol class="steps">
+<li>Откройте <b>calendar.google.com</b> на компьютере (или в браузере телефона в режиме «Версия для ПК»).</li>
+<li>Советую создать отдельный календарь: слева «Другие календари» → <b>＋ → Создать календарь</b>, например «Ad günləri», и внести дни рождения событиями <b>«Весь день»</b> с повтором <b>«Ежегодно»</b>.</li>
+<li>Наведите на этот календарь → ⋮ → <b>Настройки и общий доступ</b> → внизу <b>«Секретный адрес в формате iCal»</b> → скопировать.</li>
+<li>Вставьте адрес сюда и сохраните. Нажмите на «Главной» «👀 Что уйдёт», чтобы проверить.</li>
+</ol>
+<p class="hint">В группу уходят только события «на весь день» — встречи со временем не попадут. Встроенный календарь «Дни рождения» из контактов Google секретного адреса не даёт, поэтому дни рождения лучше завести в своём календаре. Секретный адрес никому не показывайте: по нему можно читать календарь.</p>
+</details>
+</section>
+
+<section class="card">
 <h2>🤖 Gemini</h2>
 <label>Язык ответа по умолчанию<select name="gemini_lang">${Object.entries(LANGS).map(([k, [n]]) => `<option value="${k}"${sel(k, s.gemini_lang)}>${n}</option>`).join("")}</select></label>
 <details><summary>Дополнительно</summary><div class="adv">
@@ -2043,6 +2192,15 @@ async function saveSettings(request, env) {
     clean_enabled: f.getAll("clean_enabled").includes("on"),
     gemini_model: model,
     gemini_lang: LANGS[lang] ? lang : old.gemini_lang,
+    cal_urls: (() => {
+      const urls = str("cal_urls").split(/\s+/).filter(Boolean);
+      const bad = urls.find((x) => !/^(https|webcal):\/\/\S+$/i.test(x));
+      if (bad) throw new Error(`Адрес календаря должен начинаться с https:// — «${bad.slice(0, 40)}»`);
+      return urls.join("\n");
+    })(),
+    cal_holidays: HOLIDAY_LANGS[str("cal_holidays")] ? str("cal_holidays") : "",
+    cal_hour: int("cal_hour", 0, 23, "Время календаря"),
+    cal_tomorrow: f.getAll("cal_tomorrow").includes("on"),
   };
   await env.MQM_KV.put("settings", JSON.stringify(s));
   const reset = s.url !== old.url || s.subjects !== old.subjects;
@@ -2054,6 +2212,7 @@ const TOGGLES = {
   enabled: ["Бот включён", "Бот выключен"],
   exam_enabled: ["Слежение за баллами включено", "Слежение за баллами выключено"],
   weather_enabled: ["Утренний прогноз включён", "Утренний прогноз выключен"],
+  cal_enabled: ["Календарь включён", "Календарь выключен"],
 };
 
 async function toggleSetting(request, env) {
@@ -2069,17 +2228,19 @@ const ACTION_SUMMARY = {
   exam: "баллы проверены",
   test: "тестовое сообщение отправлено в группу",
   weather: "прогноз отправлен в группу",
+  calendar: "см. подробности: что ушло в группу",
   dump: "ниже текст страницы экзамена и что из него понял бот",
   clean: "старые сообщения бота удалены",
 };
 
 async function doAction(env, action, origin) {
   const s = await loadSettings(env);
-  const base = { exam: false, weather: false, test: false, clean: false, dump: false };
+  const base = { exam: false, weather: false, calendar: false, test: false, clean: false, dump: false };
   const opts = {
     exam: { exam: true },
     test: { exam: true, test: true },
     weather: { weather: true, test: true },
+    calendar: { calendar: true, test: true },
     dump: { dump: true },
     clean: { clean: true },
   }[action];
@@ -2094,6 +2255,15 @@ async function doAction(env, action, origin) {
     try {
       const n = await backfillOrders(env);
       return { ok: true, summary: n ? `найдено и сохранено заказов: ${n} — см. вкладку «Заказы»` : "заказов в собранных сообщениях не нашлось" };
+    } catch (e) {
+      return { ok: false, summary: e.message };
+    }
+  }
+  if (action === "calendar_preview") {
+    const c = config(env, s);
+    try {
+      const msg = await calendarMessage(c, bakuNow());
+      return { ok: true, summary: msg ? "вот что уйдёт в группу (ничего не отправлено)" : "на сегодня и завтра событий нет", log: [msg, ...c.lines].filter(Boolean).join("\n\n"), open: true };
     } catch (e) {
       return { ok: false, summary: e.message };
     }
@@ -2128,6 +2298,7 @@ export default {
     const res = await run(env, s, {
       exam: s.exam_enabled && tick % s.interval === 0,
       weather: s.weather_enabled,
+      calendar: s.cal_enabled,
       test: false, clean: false, dump: false,
     }, "по расписанию");
     if (!res.ok) throw new Error(res.log);
