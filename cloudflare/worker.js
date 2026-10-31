@@ -630,7 +630,8 @@ const checked = (v) => (v ? " checked" : "");
 async function messagesSection(env, origin) {
   const hook = env.WEBHOOK_SECRET ? `${origin}/webhook/${esc(env.WEBHOOK_SECRET)}` : null;
   const rows = [
-    ["Firebase", firebaseReady(env) ? `<span class="ok">настроен</span>` : `<span class="bad">не настроен</span>`],
+    ["Firebase", !firebaseReady(env) ? `<span class="bad">не настроен</span>`
+      : env.FIREBASE_SECRET ? "вход по FIREBASE_SECRET" : "вход по FIREBASE_SERVICE_ACCOUNT"],
     ["Адрес вебхука", hook ? `<code style="word-break:break-all">${hook}</code>` : `<span class="bad">нет секрета WEBHOOK_SECRET</span>`],
   ];
   let list = "";
