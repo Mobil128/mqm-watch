@@ -329,7 +329,7 @@ async function fetchWeather(c, startDay, endDay) {
   const qs = new URLSearchParams({
     latitude: c.s.lat,
     longitude: c.s.lon,
-    hourly: "precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m",
+    hourly: "temperature_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m",
     wind_speed_unit: "kmh",
     timezone: "Asia/Baku",
     start_date: startDay,
@@ -354,6 +354,7 @@ function fmtWeather(c, h, now) {
     if (!(dt >= start && dt < end)) return;
     rows.push({
       dt,
+      temp: h.temperature_2m[i] ?? 0,
       rain: h.precipitation[i] || 0,
       prob: h.precipitation_probability[i],
       wind: h.wind_speed_10m[i] || 0,
@@ -366,9 +367,15 @@ function fmtWeather(c, h, now) {
   const total = rows.reduce((s, r) => s + r.rain, 0);
   const peak = rows.reduce((a, b) => (b.gust > a.gust ? b : a));
   const wet = rows.filter((r) => r.rain >= 0.1);
+  const span = (vals) => {
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    return lo === hi ? `${lo}` : `${lo}…${hi}`;
+  };
+  const temps = rows.map((r) => Math.round(r.temp));
   const lines = [
     `🌦 ${c.s.place} — hava proqnozu`,
     `${WEEKDAYS[(now.getUTCDay() + 6) % 7]}, ${dm(now)}.${now.getUTCFullYear()}`,
+    `🌡 Temperatur: ${span(temps)} °C`,
     total >= 0.1
       ? `🌧 Yağış: ${total.toFixed(1)} mm, saat ${hm(wet[0].dt)}–${hm(addHours(wet[wet.length - 1].dt, 1))}`
       : "☀️ Yağış gözlənilmir",
@@ -387,15 +394,14 @@ function fmtWeather(c, h, now) {
     const until = pr[pr.length - 1].dt.getUTCHours() + 1;
     const rain = pr.reduce((s, r) => s + r.rain, 0);
     const prob = Math.max(0, ...pr.map((r) => r.prob ?? 0));
-    const winds = pr.map((r) => Math.round(r.wind));
     const gust = Math.max(...pr.map((r) => r.gust));
     const dirs = {};
     pr.forEach((r) => { dirs[r.dir] = (dirs[r.dir] || 0) + 1; });
     const dir = Object.keys(dirs).reduce((a, b) => (dirs[b] > dirs[a] ? b : a));
-    const lo = Math.min(...winds), hi = Math.max(...winds);
     lines.push(`${PARTS[Math.floor(first / 6)]} ${pad(first)}–${pad(until)}: `
-      + (rain >= 0.1 ? `🌧 ${rain.toFixed(1)} mm` : prob >= 30 ? `yağış ehtimalı ${prob}%` : "yağış yox")
-      + ` · 💨 ${lo === hi ? lo : `${lo}–${hi}`} km/saat, ani ${gust.toFixed(0)}, ${dir}${gust >= STRONG_GUST ? " ⚠️" : ""}`);
+      + `🌡 ${span(pr.map((r) => Math.round(r.temp)))}° · `
+      + (rain >= 0.1 ? `🌧 ${rain.toFixed(1)} mm` : prob >= 30 ? `yağış ${prob}%` : "yağış yox")
+      + ` · 💨 ${span(pr.map((r) => Math.round(r.wind)))}, ani ${gust.toFixed(0)}, ${dir}${gust >= STRONG_GUST ? " ⚠️" : ""}`);
   }
   return lines.join("\n");
 }
