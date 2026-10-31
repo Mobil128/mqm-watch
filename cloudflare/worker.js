@@ -495,7 +495,12 @@ async function firebase(env, method, path, body) {
   const auth = env.FIREBASE_SECRET
     ? "auth=" + encodeURIComponent(env.FIREBASE_SECRET.trim())
     : "access_token=" + encodeURIComponent(await googleAccessToken(JSON.parse(env.FIREBASE_SERVICE_ACCOUNT)));
-  const res = await fetch(`${env.FIREBASE_DB_URL.trim().replace(/\/+$/, "")}${path}.json?${auth}`, {
+  let base;
+  try { base = new URL(env.FIREBASE_DB_URL.trim()); } catch { base = null; }
+  if (!base || !/\.(firebasedatabase\.app|firebaseio\.com)$/.test(base.hostname)) {
+    throw new Error(`FIREBASE_DB_URL должен быть адресом базы вида https://<проект>-default-rtdb.<регион>.firebasedatabase.app, а сейчас: ${base ? base.hostname : "не ссылка"}`);
+  }
+  const res = await fetch(`${base.origin}${path}.json?${auth}`, {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
