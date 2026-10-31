@@ -12,6 +12,7 @@
 //   FIREBASE_DB_URL     - адрес Realtime Database, https://<проект>-default-rtdb.<регион>.firebasedatabase.app (secret)
 //   FIREBASE_SECRET     - Database secret (secret) — или вместо него:
 //   FIREBASE_SERVICE_ACCOUNT - JSON ключа сервисного аккаунта целиком (secret)
+//   GEMINI_API_KEY      - (необязательно) ключ Gemini для разбора переписки на странице (secret)
 //
 // Cron Trigger в Cloudflare: "* * * * *" — воркер просыпается каждую минуту,
 // а как часто проверять экзамен, решает настройка на странице.
@@ -65,6 +66,7 @@ function defaults(env) {
     send_hour: parseInt(env.WEATHER_SEND_HOUR || "7", 10),
     hours: parseInt(env.WEATHER_HOURS || "24", 10),
     clean_enabled: true,
+    gemini_model: "gemini-flash-latest",
   };
 }
 
@@ -530,7 +532,7 @@ function secretsReport(env) {
 
 const firebaseReady = (env) => !!(env.FIREBASE_DB_URL && (env.FIREBASE_SECRET || env.FIREBASE_SERVICE_ACCOUNT));
 
-async function firebase(env, method, path, body) {
+async function firebase(env, method, path, body, query = "") {
   if (!firebaseReady(env)) throw new Error("Не заданы FIREBASE_DB_URL и FIREBASE_SECRET / FIREBASE_SERVICE_ACCOUNT");
   const auth = env.FIREBASE_SECRET
     ? "auth=" + encodeURIComponent(env.FIREBASE_SECRET.trim())
@@ -540,7 +542,7 @@ async function firebase(env, method, path, body) {
   if (!base || !/\.(firebasedatabase\.app|firebaseio\.com)$/.test(base.hostname)) {
     throw new Error(`FIREBASE_DB_URL должен быть адресом базы вида https://<проект>-default-rtdb.<регион>.firebasedatabase.app, а сейчас: ${base ? base.hostname : "не ссылка"}`);
   }
-  const res = await fetch(`${base.origin}${path}.json?${auth}`, {
+  const res = await fetch(`${base.origin}${path}.json?${auth}${query ? "&" + query : ""}`, {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
@@ -618,6 +620,197 @@ async function connectWebhook(env, origin) {
   return `Green API: ${JSON.stringify(res)}\nАдрес вебхука прописан. Green API может пару минут перезапускать инстанс.`;
 }
 
+// ---------------- Анализ переписки (статистика и Gemini) ----------------
+// Только чтение: ничего не отправляет в группы.
+
+const PERIODS = { 24: "24 часа", 72: "3 дня", 168: "7 дней", 720: "30 дней" };
+const TYPE_NAMES = {
+  textMessage: "текст", extendedTextMessage: "текст", quotedMessage: "ответ", imageMessage: "фото",
+  videoMessage: "видео", audioMessage: "голосовое", documentMessage: "документ", stickerMessage: "стикер",
+  reactionMessage: "реакция", locationMessage: "локация", contactMessage: "контакт", contactsArrayMessage: "контакты",
+  pollMessage: "опрос", pollUpdateMessage: "голос в опросе", editedMessage: "правка", deletedMessage: "удаление",
+};
+const GEMINI_MAX_CHARS = 120000; // хватает на тысячи сообщений и укладывается в бесплатные лимиты
+const FIREBASE_INDEX_HINT = `Чтобы анализ быстро работал на больших чатах, добавьте в Firebase → Realtime Database → Rules:
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "messages": { "$chat": { ".indexOn": ["timestamp"] } }
+  }
+}`;
+
+const who = (m) => (m.direction === "outgoing_api" ? "🤖 бот" : m.senderName || String(m.sender || "").replace(/@.*/, "") || "?");
+
+async function loadMessages(env, chatId, sinceSec) {
+  const path = `/messages/${fbKey(chatId)}`;
+  let data, indexed = true;
+  try {
+    data = await firebase(env, "GET", path, null, `orderBy=${encodeURIComponent('"timestamp"')}&startAt=${sinceSec}`);
+  } catch (e) {
+    if (!/index not defined/i.test(e.message)) throw e;
+    indexed = false; // без индекса берём весь чат и фильтруем сами
+    data = await firebase(env, "GET", path);
+  }
+  const list = Object.values(data || {})
+    .filter((m) => m && (m.timestamp || 0) >= sinceSec)
+    .sort((a, b) => a.timestamp - b.timestamp);
+  return { list, indexed };
+}
+
+function countBy(list, key) {
+  const out = {};
+  for (const m of list) { const k = key(m); out[k] = (out[k] || 0) + 1; }
+  return out;
+}
+
+function barRows(entries, max) {
+  return entries.map(([label, n]) => `<div class="brow" title="${esc(label)}: ${n}">`
+    + `<span class="blabel">${esc(label)}</span><span class="btrack"><span class="bfill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span>`
+    + `<span class="bval">${n}</span></div>`).join("");
+}
+
+function statsHtml(list, hours) {
+  const people = list.filter((m) => m.direction !== "outgoing_api");
+  const bot = list.length - people.length;
+  const senders = Object.entries(countBy(list, who)).sort((a, b) => b[1] - a[1]);
+  const top = senders.slice(0, 10);
+  const byHour = Array(24).fill(0);
+  list.forEach((m) => { byHour[new Date(m.timestamp * 1000 + BAKU_OFFSET_MS).getUTCHours()]++; });
+  const hourMax = Math.max(1, ...byHour);
+  const types = Object.entries(countBy(list, (m) => TYPE_NAMES[m.type] || m.type || "другое")).sort((a, b) => b[1] - a[1]);
+  const peakHour = byHour.indexOf(Math.max(...byHour));
+
+  let html = `<div class="tiles">
+<div class="tile"><b>${list.length}</b><span>сообщений</span></div>
+<div class="tile"><b>${senders.filter(([n]) => n !== "🤖 бот").length}</b><span>участников писали</span></div>
+<div class="tile"><b>${list.length ? `${pad(peakHour)}:00` : "—"}</b><span>самый активный час</span></div>
+</div>`;
+  if (bot) html += `<p class="hint">Из них ${bot} — сообщения бота (баллы, прогноз).</p>`;
+  if (!list.length) return html;
+
+  html += `<h3>Кто сколько писал</h3>${barRows(top, top[0][1])}`;
+  if (senders.length > top.length) html += `<p class="hint">и ещё ${senders.length - top.length} участников</p>`;
+
+  html += `<h3>Активность по часам (Баку)</h3><div class="cols" role="img" aria-label="Сообщения по часам">`
+    + byHour.map((n, h) => `<span class="col" title="${pad(h)}:00–${pad(h + 1)}:00 — ${n}"><span style="height:${n ? Math.max(4, Math.round(n / hourMax * 100)) : 0}%"></span></span>`).join("")
+    + `</div><div class="cols-axis"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>`;
+
+  if (hours > 24) {
+    const days = Object.entries(countBy(list, (m) => ymd(new Date(m.timestamp * 1000 + BAKU_OFFSET_MS)))).sort();
+    const dayMax = Math.max(...days.map(([, n]) => n));
+    html += `<h3>По дням</h3>${barRows(days.map(([d, n]) => [`${d.slice(8)}.${d.slice(5, 7)}`, n]), dayMax)}`;
+  }
+  html += `<h3>Типы сообщений</h3><div class="chips">${types.map(([t, n]) => `<span class="chipx">${esc(t)} · ${n}</span>`).join("")}</div>`;
+  return html;
+}
+
+function transcript(list) {
+  const lines = list.filter((m) => m.direction !== "outgoing_api").map((m) => {
+    const t = new Date(m.timestamp * 1000 + BAKU_OFFSET_MS);
+    const kind = TYPE_NAMES[m.type];
+    const text = (m.text || "").replace(/\s+/g, " ").trim();
+    const body = kind === "текст" || kind === "ответ" ? text : `<${kind || m.type || "сообщение"}${text ? ": " + text : ""}>`;
+    return `[${dm(t)} ${hm(t)}] ${who(m)}: ${body}`;
+  });
+  let total = 0, from = lines.length;
+  while (from > 0 && total + lines[from - 1].length + 1 <= GEMINI_MAX_CHARS) total += lines[--from].length + 1;
+  return { text: lines.slice(from).join("\n"), used: lines.length - from, all: lines.length };
+}
+
+async function gemini(env, model, prompt) {
+  if (!env.GEMINI_API_KEY) throw new Error("В Cloudflare не задан секрет GEMINI_API_KEY");
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY.trim() },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3 } }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${data?.error?.message || "нет ответа"}`);
+  const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+  if (!text) throw new Error("Gemini не дал ответа" + (data?.promptFeedback?.blockReason ? ` (${data.promptFeedback.blockReason})` : ""));
+  return text;
+}
+
+// Минимальная разметка ответа Gemini: экранируем, затем **жирный** и заголовки #.
+function mdLite(text) {
+  return esc(text)
+    .replace(/^#{1,4}\s*(.+)$/gm, "<b>$1</b>")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/^\s*[*-]\s+/gm, "• ");
+}
+
+const SUMMARY_PROMPT = `Ты помогаешь разобрать переписку WhatsApp-чата. Сообщения могут быть на азербайджанском, русском или турецком.
+Ответь по-русски, кратко, по разделам:
+1. Коротко — 2–3 предложения о главном.
+2. Темы — списком.
+3. Решения и договорённости — кто, что, к какому сроку.
+4. Вопросы и просьбы без ответа.
+5. Важное и срочное — даты, суммы, встречи.
+6. Настроение в чате — одной строкой.
+Опирайся только на переписку и ничего не выдумывай; если в разделе пусто, напиши «нет». Не выписывай номера телефонов.`;
+
+const ASK_PROMPT = `Ты отвечаешь на вопрос по переписке WhatsApp-чата. Сообщения могут быть на азербайджанском, русском или турецком.
+Отвечай по-русски, коротко, опираясь только на переписку. Где уместно — укажи, кто и когда это написал.
+Если в переписке ответа нет — так и скажи. Не выписывай номера телефонов.`;
+
+async function analyze(env, form) {
+  const s = await loadSettings(env);
+  const a = {
+    chat: String(form.get("chat") || ""),
+    hours: Number(form.get("period")) in PERIODS ? Number(form.get("period")) : 24,
+    question: String(form.get("question") || "").trim().slice(0, 1000),
+    action: String(form.get("do") || "stats"),
+  };
+  if (!a.chat) return { a, ok: false, html: "Выберите чат." };
+  const chats = (await firebase(env, "GET", "/chats")) || {};
+  const chat = chats[fbKey(a.chat)];
+  const name = chat?.name || a.chat;
+  const since = Math.floor(Date.now() / 1000) - a.hours * 3600;
+  const { list, indexed } = await loadMessages(env, a.chat, since);
+  const head = `<p><b>${esc(name)}</b> · за ${PERIODS[a.hours]}</p>`;
+  const hint = indexed ? "" : `<details><summary>Совет: индекс в Firebase</summary><pre>${esc(FIREBASE_INDEX_HINT)}</pre></details>`;
+
+  if (a.action === "stats") return { a, ok: true, html: head + statsHtml(list, a.hours) + hint };
+
+  const tr = transcript(list);
+  if (!tr.used) return { a, ok: true, html: head + "<p>За этот период сообщений от участников нет.</p>" + hint };
+  if (a.action === "ask" && !a.question) return { a, ok: false, html: head + "Напишите вопрос в поле «Вопрос»." };
+  const intro = a.action === "ask" ? `${ASK_PROMPT}\n\nВопрос: ${a.question}` : SUMMARY_PROMPT;
+  const answer = await gemini(env, s.gemini_model, `${intro}\n\nЧат: «${name}», период: ${PERIODS[a.hours]}.\nПереписка:\n${tr.text}`);
+  const note = tr.used < tr.all ? `<p class="hint">Gemini получил последние ${tr.used} из ${tr.all} сообщений — остальные не поместились.</p>` : "";
+  const title = a.action === "ask" ? `<p class="hint">Вопрос: ${esc(a.question)}</p>` : "";
+  return { a, ok: true, html: head + title + `<div class="md">${mdLite(answer)}</div>` + note
+    + `<p class="hint">Модель ${esc(s.gemini_model)} · сообщений: ${tr.used}</p>` + hint };
+}
+
+async function analysisSection(env, a = {}) {
+  if (!firebaseReady(env)) return "";
+  let options = "";
+  try {
+    const chats = Object.values((await firebase(env, "GET", "/chats")) || {}).sort((x, y) => (y.lastAt || 0) - (x.lastAt || 0));
+    options = chats.map((ch) => `<option value="${esc(ch.chatId)}"${ch.chatId === a.chat ? " selected" : ""}>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}</option>`).join("");
+  } catch (e) {
+    return `<section id="analysis"><h2>Анализ переписки</h2><p class="bad">${esc(e.message)}</p></section>`;
+  }
+  if (!options) return `<section id="analysis"><h2>Анализ переписки</h2><p class="hint">Пока нет собранных чатов.</p></section>`;
+  const hours = a.hours || 24;
+  return `<section id="analysis"><h2>Анализ переписки</h2>
+<form method="post" action="/analyze">
+<label>Чат<select name="chat">${options}</select></label>
+<label>Период<select name="period">${Object.entries(PERIODS).map(([h, l]) => `<option value="${h}"${Number(h) === hours ? " selected" : ""}>${l}</option>`).join("")}</select></label>
+<label>Вопрос (для кнопки «Спросить»)<textarea name="question" rows="2" placeholder="Например: что решили про субботу?">${esc(a.question || "")}</textarea></label>
+<div class="btns" style="margin-top:12px">
+<button name="do" value="stats">📊 Статистика</button>
+<button name="do" value="summary">🤖 Разбор Gemini</button>
+<button name="do" value="ask">❓ Спросить Gemini</button>
+</div>
+</form>
+${env.GEMINI_API_KEY ? "" : `<p class="hint bad">Для разбора и вопросов добавьте секрет GEMINI_API_KEY. Статистика работает без него.</p>`}
+<p class="hint">Ничего не отправляется в группы. Переписка уходит в Gemini только по кнопкам 🤖 и ❓.</p>
+</section>`;
+}
+
 // ---------------- Страница управления ----------------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
@@ -662,6 +855,24 @@ button{font:inherit;padding:12px 14px;border-radius:10px;border:0;background:var
 .msg{padding:12px 14px;border-radius:10px;margin:0 0 14px;border:1px solid var(--line);background:var(--card)}
 pre{white-space:pre-wrap;word-break:break-word;font-size:13px;background:var(--bg);padding:10px;border-radius:8px;max-height:60vh;overflow:auto;margin:8px 0 0}
 details summary{cursor:pointer;color:var(--acc);margin-top:8px}
+select,textarea{display:block;width:100%;margin-top:4px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px}
+h3{font-size:14px;margin:18px 0 8px;color:var(--mut);font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}
+.tile{border:1px solid var(--line);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:2px}
+.tile b{font-size:22px;font-variant-numeric:tabular-nums}
+.tile span{font-size:12px;color:var(--mut)}
+.brow{display:grid;grid-template-columns:minmax(0,38%) 1fr 3ch;gap:8px;align-items:center;padding:3px 0;font-size:14px}
+.blabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btrack{height:10px}
+.bfill{display:block;height:100%;background:var(--acc);border-radius:0 4px 4px 0}
+.bval{text-align:right;font-variant-numeric:tabular-nums;color:var(--mut)}
+.cols{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;height:90px;align-items:end;border-bottom:1px solid var(--line)}
+.col{height:100%;display:flex;align-items:flex-end}
+.col span{display:block;width:100%;background:var(--acc);border-radius:4px 4px 0 0}
+.cols-axis{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);margin-top:4px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chipx{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:13px}
+.md{white-space:pre-wrap;word-break:break-word;font-size:15px;line-height:1.5}
 `;
 
 function page(title, body, status = 200, headers = {}) {
@@ -736,7 +947,7 @@ ${list ? `<details><summary>Чаты</summary>${list}</details>` : ""}
 </section>`;
 }
 
-async function dashboard(env, msg, result, origin) {
+async function dashboard(env, msg, result, origin, analysis = null) {
   const s = await loadSettings(env);
   const kv = env.MQM_KV;
   const [last, state, weatherDate] = kv
@@ -774,6 +985,7 @@ async function dashboard(env, msg, result, origin) {
   return page("MQM watch", `
 <header><h1>MQM watch</h1><a href="/logout">Выйти</a></header>
 ${msg ? `<div class="msg">${msg}</div>` : ""}
+${analysis ? `<section><h2>Анализ</h2>${analysis.ok ? "" : `<div class="bad">Ошибка</div>`}${analysis.html}</section>` : ""}
 ${result ? `<section><h2>Результат</h2><div class="${result.ok ? "ok" : "bad"}">${result.ok ? "Готово" : "Ошибка"}</div><pre>${esc(result.log.slice(0, 50000))}</pre></section>` : ""}
 
 <section><h2>Статус</h2>
@@ -782,6 +994,8 @@ ${last ? `<details><summary>Лог последнего запуска</summary>
 </section>
 
 ${await messagesSection(env, origin)}
+
+${await analysisSection(env, analysis?.a)}
 
 <form method="post" action="/save">
 <section><h2>Общее</h2>
@@ -808,6 +1022,11 @@ ${await messagesSection(env, origin)}
 <label>Часов вперёд<input type="number" name="hours" min="1" max="24" value="${esc(s.hours)}"></label>
 </div>
 <label class="sw" style="margin-top:14px"><input type="checkbox" name="clean_enabled"${checked(s.clean_enabled)}> Перед прогнозом удалять вчерашние сообщения бота</label>
+</section>
+
+<section><h2>Gemini</h2>
+<label>Модель<input type="text" name="gemini_model" value="${esc(s.gemini_model)}" autocapitalize="off" spellcheck="false"></label>
+<p class="hint">По умолчанию gemini-flash-latest — всегда свежая быстрая модель. Ключ — секрет GEMINI_API_KEY в Cloudflare.</p>
 </section>
 
 <button>Сохранить настройки</button>
@@ -863,6 +1082,11 @@ async function saveSettings(request, env) {
     send_hour: int("send_hour", 0, 23, "Час отправки"),
     hours: int("hours", 1, 24, "Часов вперёд"),
     clean_enabled: f.get("clean_enabled") === "on",
+    gemini_model: (() => {
+      const m = str("gemini_model") || "gemini-flash-latest";
+      if (!/^[a-z0-9][a-z0-9.-]{1,60}$/.test(m)) throw new Error("Модель Gemini: только латинские буквы, цифры, точка и дефис, например gemini-flash-latest");
+      return m;
+    })(),
   };
   await env.MQM_KV.put("settings", JSON.stringify(s));
   const reset = s.url !== old.url || s.subjects !== old.subjects;
@@ -979,7 +1203,7 @@ export default {
       });
     }
 
-    if (path !== "/" && path !== "/save" && path !== "/action") return new Response("Not found", { status: 404 });
+    if (!["/", "/save", "/action", "/analyze"].includes(path)) return new Response("Not found", { status: 404 });
     if (!(await isAuthed(request, env))) return loginPage();
 
     if (path === "/save" && request.method === "POST") {
@@ -989,6 +1213,17 @@ export default {
       } catch (e) {
         return dashboard(env, `<span class="bad">Не сохранено: ${esc(e.message)}</span>`, null, url.origin);
       }
+    }
+
+    if (path === "/analyze" && request.method === "POST") {
+      const form = await request.formData();
+      let res;
+      try {
+        res = await analyze(env, form);
+      } catch (e) {
+        res = { a: { chat: String(form.get("chat") || ""), hours: Number(form.get("period")) || 24, question: String(form.get("question") || "") }, ok: false, html: esc(e.message) };
+      }
+      return dashboard(env, null, null, url.origin, res);
     }
 
     if (path === "/action" && request.method === "POST") {
