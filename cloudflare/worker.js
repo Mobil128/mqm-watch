@@ -235,7 +235,7 @@ async function apiCall(c, method, payload) {
   if (!(c.id && c.token && c.chat)) {
     throw new Error("Не заданы GREEN_ID_INSTANCE / GREEN_API_TOKEN / GREEN_CHAT_ID");
   }
-  const res = await fetch(`${c.api}/waInstance${c.id}/${method}/${c.token}`, {
+  const res = await fetch(`${c.api}/waInstance${c.id}/${method}/${c.token}`, payload === undefined ? {} : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -567,6 +567,23 @@ async function storeWebhook(env, body) {
   return true;
 }
 
+// Последний вебхук для страницы управления. Пишем не чаще раза в 10 минут
+// (или сразу, если результат сменился), чтобы не упереться в лимит записей KV.
+async function noteWebhook(env, ok, note) {
+  if (!env.MQM_KV) return;
+  const prev = await env.MQM_KV.get("last_webhook", "json");
+  if (prev && prev.ok === ok && Date.now() - prev.time < 10 * 60000) return;
+  await env.MQM_KV.put("last_webhook", JSON.stringify({ time: Date.now(), ok, note: String(note).slice(0, 300) }));
+}
+
+function ago(ms) {
+  const min = Math.round((Date.now() - ms) / 60000);
+  if (min < 1) return "только что";
+  if (min < 60) return `${min} мин назад`;
+  if (min < 48 * 60) return `${Math.round(min / 60)} ч назад`;
+  return bakuTime(ms);
+}
+
 // Прописывает адрес вебхука в Green API и включает уведомления о сообщениях.
 async function connectWebhook(env, origin) {
   if (!env.WEBHOOK_SECRET) throw new Error("В Cloudflare не задан секрет WEBHOOK_SECRET");
@@ -654,6 +671,29 @@ async function messagesSection(env, origin) {
       : env.FIREBASE_SECRET ? "вход по FIREBASE_SECRET" : "вход по FIREBASE_SERVICE_ACCOUNT"],
     ["Адрес вебхука", hook ? `<code style="word-break:break-all">${hook}</code>` : `<span class="bad">нет секрета WEBHOOK_SECRET</span>`],
   ];
+  const last = env.MQM_KV ? await env.MQM_KV.get("last_webhook", "json") : null;
+  rows.push(["Последний вебхук", !last ? `<span class="bad">ещё не приходил</span>`
+    : `${ago(last.time)} · ${last.ok ? `<span class="ok">OK</span>` : `<span class="bad">ошибка</span>`}<br><small>${esc(last.note)}</small>`]);
+  const c = config(env, await loadSettings(env));
+  try {
+    const st = (await apiCall(c, "getStateInstance"))?.stateInstance;
+    rows.push(["WhatsApp в Green API", st === "authorized" ? `<span class="ok">подключён</span>`
+      : `<span class="bad">${esc(st || "нет ответа")}</span> — откройте кабинет Green API`]);
+    const gs = await apiCall(c, "getSettings");
+    const want = env.WEBHOOK_SECRET ? `${origin}/webhook/${env.WEBHOOK_SECRET}` : null;
+    const flags = ["incomingWebhook", "outgoingWebhook", "outgoingAPIMessageWebhook"].filter((k) => gs?.[k] !== "yes");
+    let where;
+    if (!gs?.webhookUrl) where = `<span class="bad">не задан</span>`;
+    else if (gs.webhookUrl === want) where = `<span class="ok">наш адрес</span>`;
+    else {
+      let host = "";
+      try { host = new URL(gs.webhookUrl).host; } catch { host = "непонятный адрес"; }
+      where = `<span class="bad">другой адрес</span> (${esc(host)}${host === new URL(origin).host ? ", старый секрет" : ""})`;
+    }
+    rows.push(["Вебхук в Green API", where + (flags.length ? `<br><small class="bad">выключено: ${flags.join(", ")}</small>` : "")]);
+  } catch (e) {
+    rows.push(["Green API", `<span class="bad">${esc(e.message.slice(0, 200))}</span>`]);
+  }
   let list = "";
   if (firebaseReady(env)) {
     try {
@@ -849,7 +889,7 @@ export default {
     if (!res.ok) throw new Error(res.log);
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -872,7 +912,10 @@ export default {
     }
 
     if (path.startsWith("/webhook/")) {
-      if (!env.WEBHOOK_SECRET || path !== `/webhook/${env.WEBHOOK_SECRET}`) return new Response("Not found", { status: 404 });
+      if (!env.WEBHOOK_SECRET || path !== `/webhook/${env.WEBHOOK_SECRET}`) {
+        ctx.waitUntil(noteWebhook(env, false, "пришёл на адрес с другим секретом — нажмите «Подключить вебхук в Green API»"));
+        return new Response("Not found", { status: 404 });
+      }
       if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
       let body;
       try {
@@ -884,8 +927,10 @@ export default {
         await storeWebhook(env, body);
       } catch (e) {
         console.log("ОШИБКА вебхука:", e.message);
+        ctx.waitUntil(noteWebhook(env, false, e.message));
         return new Response("Error", { status: 500 }); // Green API пришлёт уведомление повторно
       }
+      ctx.waitUntil(noteWebhook(env, true, body.typeWebhook || "уведомление"));
       return new Response("OK");
     }
 
