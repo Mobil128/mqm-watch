@@ -13,6 +13,9 @@
 //   FIREBASE_SECRET     - Database secret (secret) — или вместо него:
 //   FIREBASE_SERVICE_ACCOUNT - JSON ключа сервисного аккаунта целиком (secret)
 //   GEMINI_API_KEY      - (необязательно) ключ Gemini для разбора переписки на странице (secret)
+//   TUYA_ACCESS_ID / TUYA_ACCESS_SECRET - (необязательно) ключи Cloud Project Tuya для реле (secret)
+//
+// Тревоги камер: POST или GET на /camera/<ключ> (адрес показан на вкладке «Дом»).
 //
 // Cron Trigger в Cloudflare: "* * * * *" — воркер просыпается каждую минуту,
 // а как часто проверять экзамен, решает настройка на странице.
@@ -29,7 +32,7 @@ const COUNTERS = {
 
 // Уборка трогает только свои исходящие сообщения с этими значками.
 const SCORE_PREFIX = "📊";
-const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test"];
+const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test", "🔌"];
 // Бесплатный план Cloudflare: не больше 50 внешних запросов за запуск.
 const MAX_DELETES = 40;
 // Бесплатный план KV: 1000 записей в сутки; каждая проверка пишет лог запуска.
@@ -68,6 +71,14 @@ function defaults(env) {
     clean_enabled: true,
     gemini_model: "gemini-flash-latest",
     gemini_lang: "ru",
+    tuya_region: "eu",
+    tuya_devices: [],
+    tuya_wa: false,
+    tuya_wa_numbers: "",
+    tuya_wa_reply: true,
+    camera_forward: false,
+    camera_chat: "",
+    camera_cooldown: 5,
   };
 }
 
@@ -419,7 +430,24 @@ async function dailyWeather(c, force) {
     c.log(last === today ? "Погода: сегодня уже отправлена" : `Погода: ещё рано (шлём после ${c.s.send_hour}:00 по Баку)`);
     return;
   }
+  if (!force) {
+    const retryAt = Number(await c.kv.get("weather_retry_at")) || 0;
+    if (Date.now() < retryAt) {
+      c.log(`Погода: прошлая попытка не удалась, следующая в ${hm(new Date(retryAt + BAKU_OFFSET_MS))}`);
+      return;
+    }
+  }
   c.acted = true;
+  try {
+    await sendForecast(c, force, now, today);
+  } catch (e) {
+    // без паузы бот пробовал бы каждую минуту: лишние запросы и расход лимита записей KV
+    if (!force) await c.kv.put("weather_retry_at", String(Date.now() + 15 * 60000), { expirationTtl: 3600 });
+    throw e;
+  }
+}
+
+async function sendForecast(c, force, now, today) {
   let cleanError = null;
   if (c.s.clean_enabled) {
     try {
@@ -586,9 +614,8 @@ async function storeWebhook(env, body) {
     [`chats/${chat}/count`]: { ".sv": { increment: 1 } },
   };
   if (sd.chatName) update[`chats/${chat}/name`] = sd.chatName;
-  const order = parseFuelOrder(messageText(body.messageData));
-  if (order && body.timestamp) {
-    update[`orders/${fbKey(body.idMessage)}`] = orderRecord(order, body.timestamp, sd.chatId, sd.chatName, sd.senderName || sd.senderContactName);
+  for (const [key, rec] of Object.entries(orderChanges(body.idMessage, body.messageData, body.timestamp, sd.chatId, sd.chatName, sd.senderName || sd.senderContactName))) {
+    update[`orders/${key}`] = rec;
   }
   await firebase(env, "PATCH", "/", update);
   return true;
@@ -601,25 +628,49 @@ async function storeWebhook(env, body) {
 const FUEL_ORDER = ["Ai92", "Ai95", "Ai98", "Dizel"];
 const NIGHT_START_HOUR = 6; // заказ с 06:00 до 06:00 следующего дня — на ночь этого дня
 
-function parseFuelOrder(text) {
-  if (!text) return null;
-  const st = text.match(/(\d{1,3})[ \t]*-?[ \t]*[a-zəıiöüşçğ]*[ \t]*say[ıi]?l[ıi][ \t]*YDS/iu) || text.match(/YDS[ \t]*(?:№|N|#|-)?[ \t]*(\d{1,3})/i);
-  if (!st) return null;
-  const fuels = {};
-  for (const m of text.matchAll(/^[ \t]*(?:ai[ \t]*-?[ \t]*(\d{2,3})|(dizel|diesel|dt))[ \t]*[-–—:=][ \t]*(\d[\d .,]*)/gimu)) {
-    const name = m[1] ? `Ai${m[1]}` : "Dizel";
-    const liters = Number(m[3].replace(/\D/g, ""));
-    if (liters > 0) fuels[name] = (fuels[name] || 0) + liters;
+const STATION_RE = /(\d{1,3})[ \t]*-?[ \t]*[a-zəıiöüşçğ]*[ \t]*say[ıi]?l[ıi][ \t]*YDS|YDS[ \t]*(?:№|N|#|-)?[ \t]*(\d{1,3})/giu;
+
+// Одно сообщение может содержать заказы на несколько АЗС — каждый блок начинается с «NN saylı YDS».
+function parseFuelOrders(text) {
+  if (!text) return [];
+  const heads = [...text.matchAll(STATION_RE)];
+  return heads.map((h, i) => {
+    const block = heads.length === 1 ? text : text.slice(h.index, i + 1 < heads.length ? heads[i + 1].index : text.length);
+    const fuels = {};
+    for (const m of block.matchAll(/^[ \t]*(?:ai[ \t]*-?[ \t]*(\d{2,3})|(dizel|diesel|dt))[ \t]*[-–—:=][ \t]*(\d[\d .,]*)/gimu)) {
+      const name = m[1] ? `Ai${m[1]}` : "Dizel";
+      const liters = Number(m[3].replace(/\D/g, ""));
+      if (liters > 0) fuels[name] = (fuels[name] || 0) + liters;
+    }
+    const r = block.match(/N[ \t]*\/[ \t]*r[ \t]*[:.\-]?[ \t]*(.+)$/im);
+    let receiver = null, phone = null;
+    if (r) {
+      const ph = r[1].match(/(?:\+?994|0)[ \t]*\(?\d{2}\)?[ \t-]*\d{3}[ \t-]*\d{2}[ \t-]*\d{2}/);
+      phone = ph ? ph[0].trim() : null;
+      receiver = (ph ? r[1].replace(ph[0], "") : r[1]).replace(/[\s,;:–-]+$/, "").trim() || null;
+    }
+    return { station: Number(h[1] || h[2]), fuels, receiver, phone };
+  }).filter((o) => Object.keys(o.fuels).length);
+}
+
+// Какие записи orders/<ключ> поменять из-за сообщения: новое — добавить, правка — заменить
+// заказы исходного сообщения, удаление у всех — убрать их (так заказ и отменяют).
+const ORDER_SLOTS = 5;
+function orderChanges(idMessage, md, timestamp, chatId, chatName, senderName) {
+  const out = {};
+  if (!md || !idMessage) return out;
+  const clear = (base) => { for (let i = 0; i < ORDER_SLOTS; i++) out[fbKey(i ? `${base}_${i}` : base)] = null; };
+  if (md.typeMessage === "deletedMessage") {
+    if (md.deletedMessageData?.stanzaId) clear(md.deletedMessageData.stanzaId);
+    return out;
   }
-  if (!Object.keys(fuels).length) return null;
-  const r = text.match(/N[ \t]*\/[ \t]*r[ \t]*[:.\-]?[ \t]*(.+)$/im);
-  let receiver = null, phone = null;
-  if (r) {
-    const ph = r[1].match(/(?:\+?994|0)[ \t]*\(?\d{2}\)?[ \t-]*\d{3}[ \t-]*\d{2}[ \t-]*\d{2}/);
-    phone = ph ? ph[0].trim() : null;
-    receiver = (ph ? r[1].replace(ph[0], "") : r[1]).replace(/[\s,;:–-]+$/, "").trim() || null;
-  }
-  return { station: Number(st[1]), fuels, receiver, phone };
+  const base = md.typeMessage === "editedMessage" && md.editedMessageData?.stanzaId ? md.editedMessageData.stanzaId : idMessage;
+  const orders = timestamp ? parseFuelOrders(messageText(md)) : [];
+  if (md.typeMessage === "editedMessage") clear(base);
+  orders.slice(0, ORDER_SLOTS).forEach((o, i) => {
+    out[fbKey(i ? `${base}_${i}` : base)] = orderRecord(o, timestamp, chatId, chatName, senderName);
+  });
+  return out;
 }
 
 const nightOf = (ts) => ymd(new Date(ts * 1000 + BAKU_OFFSET_MS - NIGHT_START_HOUR * 3600000));
@@ -631,17 +682,19 @@ function orderRecord(order, timestamp, chatId, chatName, senderName) {
 // Разовый поиск заказов в уже собранных сообщениях.
 async function backfillOrders(env) {
   const [messages, chats] = await Promise.all([firebase(env, "GET", "/messages"), firebase(env, "GET", "/chats")]);
-  const update = {};
+  const all = [];
   for (const [chatKey, list] of Object.entries(messages || {})) {
     const chat = (chats || {})[chatKey] || {};
-    for (const [id, m] of Object.entries(list || {})) {
-      const order = parseFuelOrder(m?.text);
-      if (order && m.timestamp) update[`orders/${id}`] = orderRecord(order, m.timestamp, chat.chatId || chatKey, chat.name, m.senderName);
-    }
+    for (const [id, m] of Object.entries(list || {})) if (m) all.push({ id, m, chat, chatKey });
   }
-  const n = Object.keys(update).length;
-  if (n) await firebase(env, "PATCH", "/", update);
-  return n;
+  all.sort((a, b) => (a.m.timestamp || 0) - (b.m.timestamp || 0)); // правки и удаления — после исходных сообщений
+  const changes = {};
+  for (const { id, m, chat, chatKey } of all) {
+    Object.assign(changes, orderChanges(id, m.data || { typeMessage: m.type, textMessageData: { textMessage: m.text } }, m.timestamp, chat.chatId || chatKey, chat.name, m.senderName));
+  }
+  const update = Object.fromEntries(Object.entries(changes).map(([k, v]) => [`orders/${k}`, v]));
+  if (Object.keys(update).length) await firebase(env, "PATCH", "/", update);
+  return Object.values(changes).filter(Boolean).length;
 }
 
 const liters = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
@@ -655,10 +708,11 @@ function sumFuels(list) {
 
 // Последний вебхук для страницы управления. Пишем не чаще раза в 10 минут
 // (или сразу, если результат сменился), чтобы не упереться в лимит записей KV.
-async function noteWebhook(env, ok, note) {
+async function noteWebhook(env, ok, note, weak = false) {
   if (!env.MQM_KV) return;
   const prev = await env.MQM_KV.get("last_webhook", "json");
   if (prev && prev.ok === ok && Date.now() - prev.time < 10 * 60000) return;
+  if (weak && prev && Date.now() - prev.time < 60 * 60000) return; // случайные запросы на чужой адрес — не чаще раза в час
   await env.MQM_KV.put("last_webhook", JSON.stringify({ time: Date.now(), ok, note: String(note).slice(0, 300) }));
 }
 
@@ -886,6 +940,564 @@ async function analyze(env, form) {
     + `<p class="hint">${esc(LANGS[a.lang][0])} · модель ${esc(model)}${model !== s.gemini_model ? " (запасная — основная была перегружена)" : ""} · сообщений: ${tr.used}</p>` + hint };
 }
 
+// ---------------- Дом: реле Tuya ----------------
+// Облако Tuya (platform.tuya.com): секреты TUYA_ACCESS_ID и TUYA_ACCESS_SECRET из Cloud Project,
+// к проекту привязано приложение Smart Life / Tuya Smart. Регион выбирается на вкладке «Дом».
+
+const TUYA_HOSTS = {
+  eu: ["https://openapi.tuyaeu.com", "Центральная Европа"],
+  weu: ["https://openapi-weaz.tuyaeu.com", "Западная Европа"],
+  us: ["https://openapi.tuyaus.com", "Запад США"],
+  eus: ["https://openapi-ueaz.tuyaus.com", "Восток США"],
+  in: ["https://openapi.tuyain.com", "Индия"],
+  cn: ["https://openapi.tuyacn.com", "Китай"],
+};
+const TUYA_HINTS = {
+  1004: "неверная подпись — проверьте TUYA_ACCESS_SECRET",
+  1106: "нет доступа к устройству — привяжите приложение Smart Life к проекту",
+  2008: "устройство не поддерживает такую команду",
+  28841101: "похоже, закончилась бесплатная подписка IoT Core — продлите её в кабинете Tuya",
+  28841105: "проекту не разрешён этот API — подключите IoT Core в Service API проекта",
+};
+const SWITCH_CODE = /^switch(_\d+|_led)?$/;
+const TIMER_CHOICES = [15, 60, 180];
+
+const hexOf = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const sha256Hex = async (str) => hexOf(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str)));
+async function hmacHex(secret, msg) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return hexOf(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg))).toUpperCase();
+}
+
+const tuyaReady = (env) => !!(String(env.TUYA_ACCESS_ID || "").trim() && String(env.TUYA_ACCESS_SECRET || "").trim());
+let tuyaTokenCache = null;
+
+// Подпись Tuya: HMAC-SHA256(client_id [+ access_token] + t + "METHOD\nsha256(body)\n\nURL"), URL с отсортированными параметрами.
+async function tuyaRaw(env, s, method, path, { query = null, body = null, token = null } = {}) {
+  const base = (env.TUYA_ENDPOINT || (TUYA_HOSTS[s.tuya_region] || TUYA_HOSTS.eu)[0]).replace(/\/+$/, "");
+  const qs = query ? Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join("&") : "";
+  const url = path + (qs ? `?${qs}` : "");
+  const bodyStr = body ? JSON.stringify(body) : "";
+  const id = env.TUYA_ACCESS_ID.trim();
+  const t = String(Date.now());
+  const toSign = `${method}\n${await sha256Hex(bodyStr)}\n\n${url}`;
+  const headers = { client_id: id, t, sign_method: "HMAC-SHA256", lang: "en", sign: await hmacHex(env.TUYA_ACCESS_SECRET.trim(), id + (token || "") + t + toSign) };
+  if (token) headers.access_token = token;
+  if (body) headers["Content-Type"] = "application/json";
+  const res = await fetch(base + url, { method, headers, body: body ? bodyStr : undefined });
+  const data = await res.json().catch(() => null);
+  if (!data) throw new Error(`Tuya ${res.status}: непонятный ответ`);
+  return data;
+}
+
+const tuyaError = (d) => new Error(`Tuya ${d.code}: ${d.msg || "ошибка"}${TUYA_HINTS[d.code] ? ` (${TUYA_HINTS[d.code]})` : ""}`);
+
+async function tuyaToken(env, s, fresh = false) {
+  const id = env.TUYA_ACCESS_ID.trim();
+  const valid = (t) => t && t.id === id && t.region === s.tuya_region && t.exp > Date.now() + 60000;
+  if (!fresh && valid(tuyaTokenCache)) return tuyaTokenCache.token;
+  if (!fresh && env.MQM_KV) {
+    const saved = await env.MQM_KV.get("tuya_token", "json");
+    if (valid(saved)) return (tuyaTokenCache = saved).token;
+  }
+  const d = await tuyaRaw(env, s, "GET", "/v1.0/token", { query: { grant_type: 1 } });
+  if (!d.success) throw tuyaError(d);
+  tuyaTokenCache = { token: d.result.access_token, exp: Date.now() + d.result.expire_time * 1000, id, region: s.tuya_region };
+  if (env.MQM_KV) await env.MQM_KV.put("tuya_token", JSON.stringify(tuyaTokenCache), { expirationTtl: Math.max(60, d.result.expire_time - 60) });
+  return tuyaTokenCache.token;
+}
+
+async function tuya(env, s, method, path, opts = {}) {
+  let d = await tuyaRaw(env, s, method, path, { ...opts, token: await tuyaToken(env, s) });
+  if (!d.success && (d.code === 1010 || d.code === 1011)) d = await tuyaRaw(env, s, method, path, { ...opts, token: await tuyaToken(env, s, true) });
+  if (!d.success) throw tuyaError(d);
+  return d.result;
+}
+
+async function tuyaDevice(env, s, id) {
+  const r = await tuya(env, s, "GET", `/v1.0/devices/${encodeURIComponent(id)}`);
+  const switches = (r?.status || []).filter((x) => SWITCH_CODE.test(x.code) && typeof x.value === "boolean");
+  return { id, name: r?.name || id, online: !!r?.online, switches };
+}
+
+async function tuyaSet(env, s, id, code, value) {
+  const body = { commands: [{ code, value }] };
+  try {
+    return await tuya(env, s, "POST", `/v1.0/iot-03/devices/${encodeURIComponent(id)}/commands`, { body });
+  } catch (e) {
+    if (/^Tuya (1004|1106|2008)\b/.test(e.message)) throw e;
+    return tuya(env, s, "POST", `/v1.0/devices/${encodeURIComponent(id)}/commands`, { body }); // старый адрес того же API
+  }
+}
+
+async function tuyaDiscover(env, s) {
+  const found = [];
+  let last = "";
+  for (let i = 0; i < 5; i++) {
+    const r = await tuya(env, s, "GET", "/v1.0/iot-01/associated-users/devices", { query: last ? { last_row_key: last, size: 50 } : { size: 50 } });
+    found.push(...(r?.devices || []));
+    if (!r?.has_more || !r.last_row_key) break;
+    last = r.last_row_key;
+  }
+  return found.map((d) => ({ id: d.id, name: d.name || d.id }));
+}
+
+// Имя выключателя: своё название, иначе имя устройства (+ номер канала, если каналов несколько).
+function swLabel(dev, code, count) {
+  const own = dev.aliases?.[code];
+  if (own) return own;
+  return count > 1 ? `${dev.name} ${code.replace(/\D/g, "") || code}` : dev.name;
+}
+
+async function tuyaLog(env, text, ok = true) {
+  if (!env.MQM_KV) return;
+  const list = (await env.MQM_KV.get("tuya_events", "json")) || [];
+  list.unshift({ time: Date.now(), text: String(text).slice(0, 300), ok });
+  await env.MQM_KV.put("tuya_events", JSON.stringify(list.slice(0, 30)));
+}
+
+async function setTimer(env, id, code, minutes, label) {
+  const list = ((await env.MQM_KV.get("tuya_timers", "json")) || []).filter((t) => !(t.id === id && t.code === code));
+  if (minutes) list.push({ id, code, label, at: Date.now() + minutes * 60000 });
+  await env.MQM_KV.put("tuya_timers", JSON.stringify(list));
+}
+
+// Каждую минуту: выключить то, у чего вышел таймер. Неудачное выключение — ещё до трёх попыток.
+async function runTimers(env, s) {
+  const list = (await env.MQM_KV.get("tuya_timers", "json")) || [];
+  const now = Date.now();
+  if (!list.some((t) => t.at <= now)) return;
+  const rest = list.filter((t) => t.at > now);
+  for (const t of list.filter((x) => x.at <= now)) {
+    try {
+      await tuyaSet(env, s, t.id, t.code, false);
+      await tuyaLog(env, `⏱ Таймер: ${t.label} — выключено`);
+    } catch (e) {
+      const tries = (t.tries || 0) + 1;
+      if (tries < 3) rest.push({ ...t, tries, at: now + 60000 });
+      await tuyaLog(env, `⏱ Таймер: ${t.label} — не выключилось: ${e.message}`, false);
+    }
+  }
+  await env.MQM_KV.put("tuya_timers", JSON.stringify(rest));
+}
+
+async function sendTo(env, s, chatId, message) {
+  const c = config(env, s);
+  return apiCall(c, "sendMessage", { chatId: chatId || c.chat, message });
+}
+
+// ---------------- Команды из WhatsApp ----------------
+// «!işıq aç», «!işıq bağla», «!işıq 30 dəq», «!işıq» (состояние), «!cihazlar», «!kömək».
+
+const CMD_ON = ["aç", "ac", "yandır", "yandir", "on", "вкл", "включи", "включить"];
+const CMD_OFF = ["bağla", "bagla", "söndür", "sondur", "off", "выкл", "выключи", "выключить"];
+const CMD_STATUS = ["", "?", "vəziyyət", "veziyyet", "status", "статус"];
+const CMD_LIST = ["cihazlar", "devices", "устройства"];
+const CMD_HELP = ["kömək", "komek", "help", "помощь"];
+const CMD_MIN = /^(dəq|deq|dəqiqə|deqiqe|min|мин|минут|минуты)$/;
+const lower = (x) => String(x || "").toLocaleLowerCase("az").replace(/\s+/g, " ").trim();
+
+function phoneDigits(x) {
+  let d = String(x || "").replace(/\D/g, "");
+  if (d.length === 10 && d.startsWith("0")) d = "994" + d.slice(1);
+  else if (d.length === 9) d = "994" + d;
+  return d;
+}
+
+// targets: [{ label, id, code }] — разбор без обращения к Tuya.
+function parseCommand(text, targets) {
+  const body = lower(text).replace(/^!\s*/, "");
+  if (CMD_HELP.includes(body)) return { kind: "help" };
+  if (CMD_LIST.includes(body)) return { kind: "list" };
+  const target = [...targets].sort((a, b) => b.label.length - a.label.length)
+    .find((t) => body === lower(t.label) || body.startsWith(lower(t.label) + " "));
+  if (!target) return { kind: "unknown" };
+  const words = body.slice(lower(target.label).length).trim().split(" ").filter(Boolean);
+  if (CMD_STATUS.includes(words.join(" "))) return { kind: "status", target };
+  let i = 0, value = null;
+  if (CMD_ON.includes(words[0])) { value = true; i = 1; } else if (CMD_OFF.includes(words[0])) { value = false; i = 1; }
+  const n = Number(words[i]);
+  if (Number.isInteger(n) && n > 0 && value !== false) {
+    if (words[i + 1] && !CMD_MIN.test(words[i + 1])) return { kind: "unknown" };
+    return { kind: "set", target, value: true, minutes: Math.min(n, 1440) };
+  }
+  if (value === null || words.length > i) return { kind: "unknown" };
+  return { kind: "set", target, value };
+}
+
+async function liveTargets(env, s) {
+  const out = [];
+  for (const dev of s.tuya_devices || []) {
+    let live = null;
+    try { live = await tuyaDevice(env, s, dev.id); } catch { live = null; }
+    const codes = live ? live.switches.map((x) => x.code) : dev.codes || [];
+    codes.forEach((code) => out.push({ id: dev.id, code, label: swLabel(dev, code, codes.length), on: live?.switches.find((x) => x.code === code)?.value, online: live?.online }));
+  }
+  return out;
+}
+
+const stateAz = (t) => (t.online === false ? "şəbəkədə deyil" : t.on === true ? "açıq" : t.on === false ? "bağlı" : "bilinmir");
+
+async function runCommand(env, s, text) {
+  const targets = await liveTargets(env, s);
+  const cmd = parseCommand(text, targets);
+  const example = targets[0] ? lower(targets[0].label) : "işıq";
+  if (cmd.kind === "help") {
+    return `Komandalar:\n!${example} aç\n!${example} bağla\n!${example} 30 dəq — 30 dəqiqəlik aç\n!${example} — vəziyyət\n!cihazlar — siyahı`;
+  }
+  if (cmd.kind === "list") return targets.length ? targets.map((t) => `• ${t.label} — ${stateAz(t)}`).join("\n") : "Cihaz əlavə olunmayıb.";
+  if (cmd.kind === "unknown") return `Komandanı başa düşmədim. Kömək: !kömək`;
+  const t = cmd.target;
+  if (cmd.kind === "status") return `${t.label}: ${stateAz(t)}`;
+  await tuyaSet(env, s, t.id, t.code, cmd.value);
+  if (cmd.minutes) {
+    await setTimer(env, t.id, t.code, cmd.minutes, t.label);
+    return `${t.label}: açıldı ✅, ${cmd.minutes} dəq sonra (${hm(new Date(Date.now() + cmd.minutes * 60000 + BAKU_OFFSET_MS))}) bağlanacaq`;
+  }
+  await setTimer(env, t.id, t.code, 0, t.label);
+  return `${t.label}: ${cmd.value ? "açıldı ✅" : "bağlandı ⏹"}`;
+}
+
+async function handleCommand(env, body) {
+  const dir = MESSAGE_WEBHOOKS[body.typeWebhook];
+  if (dir !== "incoming" && dir !== "outgoing") return; // свои ответы бота (outgoing_api) не разбираем
+  const text = messageText(body.messageData);
+  if (!text || !text.trim().startsWith("!") || !env.MQM_KV || !tuyaReady(env)) return;
+  const s = await loadSettings(env);
+  if (!s.tuya_wa) return;
+  const sd = body.senderData || {};
+  const allowed = new Set(String(s.tuya_wa_numbers || "").split(/[,;\n]+/).map(phoneDigits).filter(Boolean));
+  if (dir === "incoming" && !allowed.has(phoneDigits(String(sd.sender || "").replace(/@.*/, "")))) return;
+  const key = `cmd_${fbKey(body.idMessage)}`; // Green API может прислать то же уведомление повторно
+  if (await env.MQM_KV.get(key)) return;
+  await env.MQM_KV.put(key, "1", { expirationTtl: 86400 });
+  let reply, ok = true;
+  try {
+    reply = await runCommand(env, s, text);
+  } catch (e) {
+    ok = false;
+    reply = `Xəta: ${e.message}`;
+  }
+  await tuyaLog(env, `💬 ${sd.senderName || phoneDigits(sd.sender)}: ${text.trim()} → ${reply.split("\n")[0]}`, ok);
+  if (s.tuya_wa_reply) await sendTo(env, s, sd.chatId, `🔌 ${reply}`);
+}
+
+// ---------------- Дом: тревоги камер ----------------
+// Адрес /camera/<ключ>: ключ выводится из WEBHOOK_SECRET, отдельный секрет не нужен.
+
+const CAMERA_COOLDOWNS = [0, 1, 5, 15, 30, 60];
+const cameraToken = async (env) => (env.WEBHOOK_SECRET ? (await sha256Hex("camera:" + env.WEBHOOK_SECRET)).slice(0, 24) : null);
+
+async function cameraEvent(env, ev) {
+  const s = await loadSettings(env);
+  const now = Date.now();
+  const camera = String(ev.camera || ev.app || "Kamera").replace(/\s+/g, " ").trim().slice(0, 80) || "Kamera";
+  const text = [ev.title, ev.text].filter((x) => x && String(x).trim()).map(String).join(" — ").replace(/\s+/g, " ").trim().slice(0, 500);
+  let forwarded = false, reason = "";
+  if (!s.camera_forward) reason = "пересылка в WhatsApp выключена";
+  else {
+    const last = (await env.MQM_KV.get("camera_last", "json")) || {};
+    if (s.camera_cooldown && now - (last[camera] || 0) < s.camera_cooldown * 60000) reason = "пауза между тревогами этой камеры";
+    else {
+      await sendTo(env, s, s.camera_chat || null, `🚨 ${camera}${text ? `\n${text}` : ""}\n🕒 ${bakuTime(now)}`);
+      last[camera] = now;
+      await env.MQM_KV.put("camera_last", JSON.stringify(last));
+      forwarded = true;
+    }
+  }
+  if (firebaseReady(env)) {
+    await firebase(env, "PATCH", "/", { [`camera_events/${now}_${Math.random().toString(36).slice(2, 8)}`]: { time: now, camera, text, forwarded } })
+      .catch((e) => console.log("Тревога не сохранена:", e.message));
+  }
+  return { forwarded, reason };
+}
+
+const gmailScript = (camUrl) => `const URL = "${camUrl}";
+const QUERY = "is:unread from:(АДРЕС_КАМЕРЫ)";
+function forwardCamera() {
+  for (const thread of GmailApp.search(QUERY, 0, 20)) {
+    for (const m of thread.getMessages()) {
+      if (!m.isUnread()) continue;
+      UrlFetchApp.fetch(URL, { method: "post", contentType: "application/json",
+        payload: JSON.stringify({ camera: m.getFrom(), title: m.getSubject(), text: m.getPlainBody().slice(0, 300) }) });
+      m.markRead();
+    }
+  }
+}`;
+
+// ---------------- Дом: страница ----------------
+
+async function houseStatus(env, s) {
+  const kv = env.MQM_KV;
+  const safe = (p) => p.then((v) => ({ v }), (e) => ({ e: e.message }));
+  const devs = s.tuya_devices || [];
+  let tokenError = null;
+  if (tuyaReady(env) && devs.length) tokenError = await tuyaToken(env, s).then(() => null, (e) => e.message);
+  const [timers, events, live, cams] = await Promise.all([
+    kv ? kv.get("tuya_timers", "json") : null,
+    kv ? kv.get("tuya_events", "json") : null,
+    tuyaReady(env) && devs.length && !tokenError ? Promise.all(devs.map((d) => safe(tuyaDevice(env, s, d.id)))) : [],
+    firebaseReady(env) ? safe(firebase(env, "GET", "/camera_events", null, `orderBy=${encodeURIComponent('"$key"')}&limitToLast=10`)) : { v: null },
+  ]);
+  const camEvents = cams.v ? Object.values(cams.v).sort((a, b) => b.time - a.time) : [];
+  return { devs, tokenError, timers: timers || [], events: events || [], live, camEvents, camError: cams.e };
+}
+
+function switchRows(dev, live, timers, back) {
+  const count = live.switches.length;
+  return live.switches.map((x) => {
+    const label = swLabel(dev, x.code, count);
+    const timer = timers.find((t) => t.id === dev.id && t.code === x.code);
+    const hidden = `<input type="hidden" name="id" value="${esc(dev.id)}"><input type="hidden" name="code" value="${esc(x.code)}"><input type="hidden" name="back" value="${back}">`;
+    return `<div class="swrow">
+<form method="post" action="/house"><input type="hidden" name="do" value="switch">${hidden}<input type="hidden" name="v" value="off">
+<label class="switch"><span>${esc(label)}${live.online ? "" : ` <small class="bad">не в сети</small>`}</span><input type="checkbox" name="v" value="on"${checked(x.value)} onchange="this.form.requestSubmit()" aria-label="${esc(label)}"></label></form>
+${timer
+    ? `<form method="post" action="/house" class="timerline active"><input type="hidden" name="do" value="timer_cancel">${hidden}<span class="meta">⏱ выключится в ${hm(new Date(timer.at + BAKU_OFFSET_MS))}</span><button class="btn small">Отменить</button></form>`
+    : `<form method="post" action="/house" class="timerline"><input type="hidden" name="do" value="timer">${hidden}<span class="meta">Включить на</span>${TIMER_CHOICES.map((m) => `<button class="btn small" name="minutes" value="${m}">${m < 60 ? `${m} мин` : `${m / 60} ч`}</button>`).join("")}</form>`}
+</div>`;
+  }).join("");
+}
+
+function homeHouseCard(env, st) {
+  const h = st.house;
+  if (!tuyaReady(env) || !h.devs.length) return "";
+  const rows = h.devs.map((dev, i) => {
+    const live = h.live[i];
+    if (!live || live.e) return `<p class="meta">${esc(dev.name)}: <span class="bad">нет связи</span></p>`;
+    return switchRows(dev, live.v, h.timers, "home");
+  }).join("");
+  return `<section class="card"><h2>🏠 Дом</h2>${h.tokenError ? `<p class="bad">${esc(h.tokenError)}</p>` : rows}<a class="btn" href="#house">Всё о доме</a></section>`;
+}
+
+function housePanel(env, st, origin) {
+  const { s } = st;
+  const h = st.house;
+  const ready = tuyaReady(env);
+  const region = TUYA_HOSTS[s.tuya_region] || TUYA_HOSTS.eu;
+
+  const devices = h.devs.map((dev, i) => {
+    const live = h.live[i];
+    const head = `<h2>${esc(dev.name)}${live?.v ? `<span class="pill ${live.v.online ? "ok" : "bad"}">${live.v.online ? "в сети" : "не в сети"}</span>` : ""}</h2>`;
+    const body = !ready ? `<p class="meta">Управление заработает после добавления ключей Tuya.</p>`
+      : h.tokenError ? `<p class="bad">${esc(h.tokenError)}</p>`
+      : live?.e ? `<p class="bad">${esc(live.e)}</p>`
+      : live?.v?.switches.length ? switchRows(dev, live.v, h.timers, "house")
+      : `<p class="meta">У устройства не нашлось выключателей.</p>`;
+    const codes = live?.v?.switches.map((x) => x.code) || [];
+    return `<section class="card">${head}${body}
+<details><summary>Настроить</summary><form method="post" action="/house" class="adv">
+<input type="hidden" name="id" value="${esc(dev.id)}">
+<label>Название<input type="text" name="name" value="${esc(dev.name)}"></label>
+${codes.map((code) => `<label>Имя для команд: ${esc(code)}<input type="text" name="alias_${esc(code)}" value="${esc(dev.aliases?.[code] || "")}" placeholder="${esc(swLabel({ ...dev, aliases: {} }, code, codes.length))}"></label>`).join("")}
+<p class="hint">Device ID: <code>${esc(dev.id)}</code></p>
+<button class="btn" name="do" value="device_save">Сохранить</button>
+<button class="btn danger" name="do" value="device_remove" data-confirm="Убрать устройство из бота? В приложении Tuya оно останется.">Убрать из бота</button>
+</form></details>
+</section>`;
+  }).join("");
+
+  const steps = `<ol class="steps">
+<li>Зайдите на <b>platform.tuya.com</b> под любым e-mail (это кабинет разработчика, он бесплатный).</li>
+<li><b>Cloud → Development → Create Cloud Project</b>: Development Method — <i>Smart Home</i>, Data Center — тот же регион, что ниже.</li>
+<li>В проекте: <b>Devices → Link App Account → Add App Account</b> и отсканируйте QR-код в приложении Smart Life / Tuya Smart (Профиль → значок сканера). Ваши устройства появятся в проекте.</li>
+<li>Во вкладке <b>Overview</b> скопируйте <b>Access ID</b> и <b>Access Secret</b>.</li>
+<li>В Cloudflare добавьте два секрета: <code>TUYA_ACCESS_ID</code> и <code>TUYA_ACCESS_SECRET</code> (тип Secret, имена набрать вручную, затем Deploy).</li>
+<li>Вернитесь сюда и нажмите «Найти мои устройства».</li>
+</ol>
+<p class="hint">Бесплатный доступ к API Tuya (IoT Core) выдаётся на пробный срок, потом его продлевают бесплатно в кабинете Tuya. Если команды перестанут проходить с ошибкой про подписку — дело в этом.</p>`;
+
+  const connect = `<section class="card">
+<h2>🔌 Реле Tuya</h2>
+<p class="meta">${ready ? `Ключи на месте · регион: ${esc(region[1])} · устройств: ${h.devs.length}` : `<span class="warn">Ещё не подключено</span> — нет секретов TUYA_ACCESS_ID / TUYA_ACCESS_SECRET.`}</p>
+${ready ? "" : steps}
+<form method="post" action="/house" class="adv">
+<input type="hidden" name="do" value="region_save">
+<label>Регион (Data Center) проекта Tuya<select name="region" onchange="this.form.requestSubmit()">${Object.entries(TUYA_HOSTS).map(([k, [, n]]) => `<option value="${k}"${sel(k, s.tuya_region)}>${n}</option>`).join("")}</select></label>
+</form>
+${ready ? `<form method="post" action="/house"><input type="hidden" name="do" value="discover"><button class="btn primary">🔎 Найти мои устройства</button></form>
+<details><summary>Добавить по Device ID</summary><form method="post" action="/house" class="adv">
+<input type="hidden" name="do" value="device_add">
+<label>Device ID (Tuya → проект → Devices)<input type="text" name="id" autocapitalize="off" spellcheck="false"></label>
+<label>Название<input type="text" name="name" placeholder="например: Işıq"></label>
+<button class="btn">Добавить</button></form></details>
+${ready && !h.devs.length ? "" : `<details><summary>Как это работает</summary>${steps}</details>`}` : ""}
+</section>`;
+
+  const help = (() => {
+    const first = h.live.find((x) => x?.v?.switches.length);
+    const ex = first ? lower(swLabel(h.devs[h.live.indexOf(first)], first.v.switches[0].code, first.v.switches.length)) : "işıq";
+    return `<ul class="cmds"><li><code>!${esc(ex)} aç</code> — включить</li><li><code>!${esc(ex)} bağla</code> — выключить</li><li><code>!${esc(ex)} 30 dəq</code> — включить на 30 минут</li><li><code>!${esc(ex)}</code> — состояние</li><li><code>!cihazlar</code> — все устройства</li><li><code>!kömək</code> — подсказка</li></ul>
+<p class="hint">Понимает и по-русски/английски: вкл/выкл, on/off, «30 мин».</p>`;
+  })();
+
+  const wa = `<form class="card" method="post" action="/house">
+<input type="hidden" name="do" value="wa_save">
+<h2>💬 Команды из WhatsApp</h2>
+<input type="hidden" name="tuya_wa" value="off">
+<label class="switch">Управлять реле сообщениями<input type="checkbox" name="tuya_wa" value="on"${checked(s.tuya_wa)}></label>
+<label>Кому можно (номера через запятую)<input type="text" name="numbers" inputmode="tel" value="${esc(s.tuya_wa_numbers)}" placeholder="+994 50 123 45 67, 055 765 43 21"></label>
+<input type="hidden" name="reply" value="off">
+<label class="switch">Отвечать в чат «готово»<input type="checkbox" name="reply" value="on"${checked(s.tuya_wa_reply)}></label>
+<details><summary>Какие команды</summary>${help}</details>
+<p class="hint">Команды с телефона самого бота принимаются всегда, от остальных — только с этих номеров. Ответы бота считаются в лимит Green API (на бесплатном тарифе — 3 чата в месяц).</p>
+<button class="btn">💾 Сохранить</button>
+</form>`;
+
+  const camUrl = st.cameraUrl;
+  const chats = st.chatList.map((ch) => `<option value="${esc(ch.chatId)}"${sel(ch.chatId, s.camera_chat)}>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}</option>`).join("");
+  const cam = `<form class="card" method="post" action="/house">
+<input type="hidden" name="do" value="camera_save">
+<h2>🚨 Тревоги камер</h2>
+<input type="hidden" name="camera_forward" value="off">
+<label class="switch">Пересылать тревоги в WhatsApp<input type="checkbox" name="camera_forward" value="on"${checked(s.camera_forward)}></label>
+<label>Куда<select name="camera_chat"><option value=""${sel("", s.camera_chat)}>Основная группа бота</option>${chats}</select></label>
+<label>Не чаще чем<select name="camera_cooldown">${CAMERA_COOLDOWNS.map((m) => `<option value="${m}"${sel(m, s.camera_cooldown)}>${m ? `раз в ${m} мин на камеру` : "без паузы"}</option>`).join("")}</select></label>
+<button class="btn">💾 Сохранить</button>
+</form>
+<section class="card">
+<h2>Последние тревоги</h2>
+${h.camError ? `<p class="bad">${esc(h.camError)}</p>` : h.camEvents.length
+    ? h.camEvents.map((e) => `<div class="row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small></span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("")
+    : `<p class="meta">Пока не было.${firebaseReady(env) ? "" : " Список хранится в Firebase — он не настроен."}</p>`}
+<form method="post" action="/house"><input type="hidden" name="do" value="camera_test"><button class="btn" data-confirm="Отправить тестовую тревогу${s.camera_forward ? " в WhatsApp" : ""}?">🧪 Тестовая тревога</button></form>
+</section>
+<details class="card"><summary>Как подключить камеры</summary>
+${camUrl ? `<p class="meta">Адрес для тревог (никому не показывайте):</p><code>${esc(camUrl)}</code>
+<button type="button" class="btn small" data-copy="${esc(camUrl)}">📋 Скопировать адрес</button>
+<h3>Вариант 1 — телефон Android (MacroDroid)</h3>
+<ol class="steps">
+<li>Установите <b>MacroDroid</b> на Android-телефон, на котором стоит приложение камеры (iCSee и второе), и разрешите ему доступ к уведомлениям.</li>
+<li>Новый макрос → <b>Триггер: Уведомление получено</b> → выберите приложение iCSee (и второе приложение камеры).</li>
+<li><b>Действие: HTTP-запрос</b> → метод <b>POST</b>, адрес — как выше, тип содержимого <b>application/json</b>.</li>
+<li>Тело запроса: <code>{"camera":"Двор","title":"[notification_title]","text":"[notification]"}</code> — заголовок и текст уведомления вставьте кнопкой «…» (Magic Text).</li>
+<li>Нажмите «Тест» в MacroDroid — тревога появится ниже и, если включено, в WhatsApp.</li>
+</ol>
+<p class="hint">Телефон должен быть всегда включён и в сети — лучше отдельный старый Android дома.</p>
+<h3>Вариант 2 — e-mail камеры (если в iCSee есть «тревога по почте»)</h3>
+<ol class="steps">
+<li>В камере укажите отправку тревог на ваш Gmail.</li>
+<li>Откройте <b>script.google.com</b> → новый проект → вставьте код ниже, в <code>QUERY</code> впишите адрес, с которого приходят письма камеры.</li>
+<li>Слева «Триггеры» → добавить → функция <code>forwardCamera</code>, по времени, каждую минуту.</li>
+</ol>
+<button type="button" class="btn small" data-copy="${esc(gmailScript(camUrl))}">📋 Скопировать код</button>
+<pre>${esc(gmailScript(camUrl))}</pre>
+<h3>Проверка вручную</h3>
+<p class="meta"><a href="${esc(camUrl)}?camera=Test&amp;text=Hereket" target="_blank" rel="noopener">Открыть проверочную ссылку</a> — придёт тестовая тревога.</p>
+<p class="hint">Снимки с камер — следующий этап: по почте они приходят вложением, бот сможет пересылать фото.</p>` : `<p class="bad">Нужен секрет WEBHOOK_SECRET — из него строится адрес для тревог.</p>`}
+</details>`;
+
+  const log = h.events.length ? `<details class="card"><summary>Журнал дома (${h.events.length})</summary>${h.events.map((e) => `<div class="row"><span>${esc(e.text)}</span><span><small>${bakuTime(e.time)}</small>${e.ok ? "" : ` <span class="bad">⚠️</span>`}</span></div>`).join("")}</details>` : "";
+
+  return `${devices}${connect}${wa}${cam}${log}`;
+}
+
+// Действия вкладки «Дом». Возвращает текст для сообщения наверху страницы.
+async function houseAction(env, form) {
+  const s = await loadSettings(env);
+  const str = (k) => String(form.get(k) ?? "").trim();
+  const on = (k) => form.getAll(k).includes("on");
+  const save = (patch) => env.MQM_KV.put("settings", JSON.stringify({ ...s, ...patch }));
+  const devs = s.tuya_devices || [];
+  const action = str("do");
+  const needTuya = () => { if (!tuyaReady(env)) throw new Error("Сначала добавьте секреты TUYA_ACCESS_ID и TUYA_ACCESS_SECRET"); };
+  const findDev = () => {
+    const dev = devs.find((d) => d.id === str("id"));
+    if (!dev) throw new Error("Устройство не найдено — обновите страницу");
+    return dev;
+  };
+  const labelOf = async (dev, code) => {
+    const live = await tuyaDevice(env, s, dev.id).catch(() => null);
+    return swLabel(dev, code, live ? live.switches.length : 1);
+  };
+
+  if (action === "switch" || action === "timer" || action === "timer_cancel") {
+    needTuya();
+    const dev = findDev();
+    const code = str("code");
+    if (!SWITCH_CODE.test(code)) throw new Error("Неизвестный выключатель");
+    const label = await labelOf(dev, code);
+    if (action === "timer_cancel") {
+      await setTimer(env, dev.id, code, 0, label);
+      return `${label}: таймер отменён`;
+    }
+    const minutes = action === "timer" ? Number(str("minutes")) : 0;
+    if (action === "timer" && !TIMER_CHOICES.includes(minutes)) throw new Error("Неверное время таймера");
+    const value = action === "timer" ? true : on("v");
+    await tuyaSet(env, s, dev.id, code, value);
+    await setTimer(env, dev.id, code, minutes, label);
+    await tuyaLog(env, `📱 Страница: ${label} — ${value ? "включено" : "выключено"}${minutes ? ` на ${minutes} мин` : ""}`);
+    return minutes
+      ? `${label}: включено, выключится в ${hm(new Date(Date.now() + minutes * 60000 + BAKU_OFFSET_MS))}`
+      : `${label}: ${value ? "включено" : "выключено"}`;
+  }
+  if (action === "discover") {
+    needTuya();
+    const found = await tuyaDiscover(env, s);
+    const fresh = found.filter((d) => !devs.some((x) => x.id === d.id));
+    await save({ tuya_devices: [...devs, ...fresh.map((d) => ({ id: d.id, name: d.name, aliases: {} }))] });
+    return found.length ? `Найдено устройств: ${found.length}, добавлено новых: ${fresh.length}` : "Устройств не нашлось — проверьте, что приложение Smart Life привязано к проекту и регион выбран верно";
+  }
+  if (action === "device_add") {
+    needTuya();
+    const id = str("id");
+    if (!/^[A-Za-z0-9]{6,40}$/.test(id)) throw new Error("Device ID — латинские буквы и цифры, как в кабинете Tuya");
+    if (devs.some((d) => d.id === id)) throw new Error("Это устройство уже добавлено");
+    const live = await tuyaDevice(env, s, id);
+    await save({ tuya_devices: [...devs, { id, name: str("name") || live.name, aliases: {} }] });
+    return `Добавлено: ${str("name") || live.name}`;
+  }
+  if (action === "device_save") {
+    const dev = findDev();
+    const aliases = {};
+    for (const [k, v] of form.entries()) {
+      if (k.startsWith("alias_") && SWITCH_CODE.test(k.slice(6)) && String(v).trim()) aliases[k.slice(6)] = String(v).trim().slice(0, 40);
+    }
+    const name = (str("name") || dev.name).slice(0, 40);
+    const next = devs.map((d) => (d.id === dev.id ? { ...d, name, aliases } : d));
+    const labels = next.flatMap((d) => Object.values(d.aliases || {}).concat(d.name)).map(lower);
+    const dup = labels.find((l, i) => labels.indexOf(l) !== i);
+    if (dup) throw new Error(`Имя «${dup}» уже занято — для команд имена должны различаться`);
+    await save({ tuya_devices: next });
+    return `Сохранено: ${name}`;
+  }
+  if (action === "device_remove") {
+    const dev = findDev();
+    await save({ tuya_devices: devs.filter((d) => d.id !== dev.id) });
+    const timers = ((await env.MQM_KV.get("tuya_timers", "json")) || []).filter((t) => t.id !== dev.id);
+    await env.MQM_KV.put("tuya_timers", JSON.stringify(timers));
+    return `Убрано из бота: ${dev.name}`;
+  }
+  if (action === "region_save") {
+    const region = str("region");
+    if (!TUYA_HOSTS[region]) throw new Error("Неизвестный регион");
+    await save({ tuya_region: region });
+    tuyaTokenCache = null;
+    await env.MQM_KV.delete("tuya_token");
+    return `Регион Tuya: ${TUYA_HOSTS[region][1]}`;
+  }
+  if (action === "wa_save") {
+    const numbers = str("numbers").split(/[,;\n]+/).map((x) => x.trim()).filter(Boolean);
+    const bad = numbers.find((n) => phoneDigits(n).length < 11 || phoneDigits(n).length > 13);
+    if (bad) throw new Error(`Не похоже на номер: «${bad}»`);
+    await save({ tuya_wa: on("tuya_wa"), tuya_wa_numbers: numbers.join(", "), tuya_wa_reply: on("reply") });
+    return on("tuya_wa") ? "Команды из WhatsApp включены" : "Команды из WhatsApp выключены";
+  }
+  if (action === "camera_save") {
+    const chat = str("camera_chat");
+    const cooldown = Number(str("camera_cooldown"));
+    if (!CAMERA_COOLDOWNS.includes(cooldown)) throw new Error("Неверная пауза");
+    if (chat && !/^[\w.-]+@(g|c)\.us$/.test(chat)) throw new Error("Неверный чат");
+    await save({ camera_forward: on("camera_forward"), camera_chat: chat, camera_cooldown: cooldown });
+    return on("camera_forward") ? "Тревоги будут приходить в WhatsApp" : "Пересылка тревог выключена";
+  }
+  if (action === "camera_test") {
+    const r = await cameraEvent(env, { camera: "Test", text: "Sınaq həyəcan siqnalı" });
+    return r.forwarded ? "Тестовая тревога отправлена в WhatsApp" : `Тестовая тревога записана (${r.reason})`;
+  }
+  throw new Error("Неизвестное действие");
+}
+
 // ---------------- Страница управления ----------------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
@@ -901,7 +1513,8 @@ async function isAuthed(request, env) {
   return !!m && m[1] === (await authToken(env));
 }
 
-const TABS = ["home", "orders", "analysis", "settings", "service"];
+const TABS = ["home", "orders", "house", "analysis", "settings", "service"];
+const NAV = ["home", "orders", "house", "analysis", "settings"]; // «Сервис» — внутри «Настроек»
 const INTERVALS = [5, 10, 15, 20, 30, 60, 120, 180, 360, 720, 1440];
 const intervalLabel = (m) => (m < 60 ? `каждые ${m} мин` : m === 60 ? "каждый час" : m === 1440 ? "раз в сутки" : `каждые ${m / 60} ч`);
 
@@ -991,18 +1604,30 @@ input[type=date]{width:100%;padding:10px 12px;border:1px solid var(--line);borde
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chipx{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:13px}
 .md{white-space:pre-wrap;word-break:break-word;font-size:15px;line-height:1.55}
+.pill{font-size:12px;font-weight:600;padding:2px 10px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.swrow{display:grid;gap:6px;padding:8px 0;border-top:1px solid var(--line)}
+.swrow:first-of-type{border-top:0;padding-top:0}
+.timerline{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+#p-home .timerline:not(.active){display:none}
+.btn.small{width:auto;padding:6px 12px;font-size:14px;font-weight:500;border-radius:999px}
+.steps{margin:0;padding-left:20px;display:grid;gap:6px;font-size:14px}
+.cmds{margin:0;padding-left:18px;display:grid;gap:4px;font-size:14px}
+.subnav{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px}
+.subnav a{text-align:center;padding:8px;border-radius:9px;text-decoration:none;color:var(--fg);font-size:15px}
+.subnav a[aria-current=page]{background:var(--acc-soft);color:var(--acc);font-weight:600}
 @media (prefers-reduced-motion:reduce){.switch input,.switch input::after{transition:none}}
 `;
 
 // Вкладки, подтверждения и «Подождите…» на кнопках. Без JS все вкладки видны подряд.
 const CLIENT_JS = `
 (function(){
-  var tabs = ["home","orders","analysis","settings","service"];
+  var tabs = ["home","orders","house","analysis","settings","service"];
   var start = document.body.getAttribute("data-tab") || "home";
   function show(t){
     if (tabs.indexOf(t) < 0) t = start;
     tabs.forEach(function(x){ var p = document.getElementById("p-" + x); if (p) p.hidden = x !== t; });
-    document.querySelectorAll(".nav a").forEach(function(a){ a.setAttribute("aria-current", a.getAttribute("data-tab") === t ? "page" : "false"); });
+    var navTab = t === "service" ? "settings" : t;
+    document.querySelectorAll(".nav a").forEach(function(a){ a.setAttribute("aria-current", a.getAttribute("data-tab") === navTab ? "page" : "false"); });
     window.scrollTo(0, 0);
   }
   if (location.pathname !== "/") { history.replaceState(null, "", "/#" + start); show(start); }
@@ -1013,7 +1638,17 @@ const CLIENT_JS = `
     }
     show(location.hash.slice(1) || start);
   }
-  window.addEventListener("hashchange", function(){ show(location.hash.slice(1)); });
+  window.addEventListener("hashchange", function(){
+    var flash = document.getElementById("flash"); if (flash) flash.remove(); // сообщение относится к прошлой вкладке
+    show(location.hash.slice(1));
+  });
+  document.addEventListener("click", function(e){
+    var b = e.target.closest && e.target.closest("[data-copy]");
+    if (!b) return;
+    navigator.clipboard.writeText(b.getAttribute("data-copy")).then(
+      function(){ b.textContent = "✓ Скопировано"; },
+      function(){ b.textContent = "Не вышло — выделите вручную"; });
+  });
   document.addEventListener("submit", function(e){
     var b = e.submitter;
     if (b && b.getAttribute("data-confirm") && !confirm(b.getAttribute("data-confirm"))) { e.preventDefault(); return; }
@@ -1027,17 +1662,18 @@ const CLIENT_JS = `
 `;
 
 const ICONS = {
-  home: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/>',
+  home: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+  house: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/>',
   analysis: '<path d="M3 21h18M6 17v-6M11 17V5M16 17v-9M21 17v-3"/>',
   settings: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
   service: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   orders: '<path d="M4 21V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v16M3 21h12M7 8h4M14 9h2a2 2 0 0 1 2 2v5a1.5 1.5 0 0 0 3 0V8l-3-3"/>',
 };
-const TAB_NAMES = { home: "Главная", orders: "Заказы", analysis: "Анализ", settings: "Настройки", service: "Сервис" };
+const TAB_NAMES = { home: "Главная", orders: "Заказы", house: "Дом", analysis: "Анализ", settings: "Настройки", service: "Сервис" };
 
 function page(title, body, { tab = "home", status = 200, nav = true } = {}) {
   const navHtml = nav
-    ? `<nav class="nav" aria-label="Разделы">${TABS.map((t) => `<a href="#${t}" data-tab="${t}"><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[t]}</svg>${TAB_NAMES[t]}</a>`).join("")}</nav><script>${CLIENT_JS}</script>`
+    ? `<nav class="nav" aria-label="Разделы">${NAV.map((t) => `<a href="#${t}" data-tab="${t}"><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[t]}</svg>${TAB_NAMES[t]}</a>`).join("")}</nav><script>${CLIENT_JS}</script>`
     : "";
   return new Response(
     `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">`
@@ -1101,19 +1737,22 @@ async function gatherStatus(env, origin) {
     const url = gSettings.v.webhookUrl;
     hookWhere = !url ? "none" : url === want ? "ours" : "other";
   }
-  return { s, kv, last, state, weatherDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList };
+  const house = await houseStatus(env, s);
+  const camToken = await cameraToken(env);
+  const cameraUrl = camToken ? `${origin}/camera/${camToken}` : null;
+  return { s, kv, last, state, weatherDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl };
 }
 
 function problems(env, st) {
   const out = [];
   if (!st.kv) out.push(["Не привязано хранилище KV", "Бот не может запоминать баллы и настройки."]);
-  if (/class="bad"/.test(secretsReport(env))) out.push(["Не хватает секретов", "Откройте «Сервис» — там видно, каких именно."]);
+  if (/class="bad"/.test(secretsReport(env))) out.push(["Не хватает секретов", "«Настройки» → «Сервис» — там видно, каких именно."]);
   if (st.gState.v && st.gState.v.stateInstance !== "authorized") out.push(["WhatsApp отключён от Green API", "Откройте кабинет Green API и заново отсканируйте QR-код телефоном бота."]);
   if (st.gState.e) out.push(["Green API не отвечает", st.gState.e.slice(0, 160)]);
-  if (st.hookWhere && st.hookWhere !== "ours") out.push(["Сообщения не собираются", "Green API шлёт их не туда. «Сервис» → «Подключить вебхук»."]);
+  if (st.hookWhere && st.hookWhere !== "ours") out.push(["Сообщения не собираются", "Green API шлёт их не туда. «Настройки» → «Сервис» → «Подключить вебхук»."]);
   if (st.lastHook && !st.lastHook.ok) out.push(["Последнее сообщение не сохранилось", st.lastHook.note]);
   if (st.chats.e) out.push(["Firebase не отвечает", st.chats.e.slice(0, 160)]);
-  if (st.last && !st.last.ok) out.push(["Последний запуск с ошибкой", "Подробности — «Сервис» → «Лог последнего запуска»."]);
+  if (st.last && !st.last.ok) out.push(["Последний запуск с ошибкой", "Подробности — «Настройки» → «Сервис» → «Лог последнего запуска»."]);
   return out;
 }
 
@@ -1138,6 +1777,8 @@ ${probs.map(([t, d]) => `<div class="alert" role="alert"><b>⚠️ ${esc(t)}</b>
 ${toggleForm("enabled", s.enabled, `<b>Бот ${s.enabled ? "работает" : "выключен"}</b>`)}
 <p class="meta">${last ? `Последний запуск: ${bakuTime(last.time)} · ${esc(last.source)} · ${last.ok ? `<span class="ok">без ошибок</span>` : `<span class="bad">ошибка</span>`}` : "Ещё не запускался."}${s.enabled ? "" : " Пока выключен, по расписанию ничего не делает; кнопки работают."}</p>
 </section>
+
+${homeHouseCard(env, st)}
 
 <section class="card">
 <h2>📊 Экзамен</h2>
@@ -1267,10 +1908,12 @@ ${env.GEMINI_API_KEY ? "" : `<p class="hint bad">Для «Разбора» и «
 </form>`;
 }
 
+const subnav = (cur) => `<nav class="subnav" aria-label="Настройки и сервис"><a href="#settings"${cur === "settings" ? ' aria-current="page"' : ""}>⚙️ Настройки</a><a href="#service"${cur === "service" ? ' aria-current="page"' : ""}>🩺 Сервис</a></nav>`;
+
 function settingsPanel(st) {
   const { s } = st;
   const intervals = INTERVALS.includes(s.interval) ? INTERVALS : [...INTERVALS, s.interval].sort((x, y) => x - y);
-  return `<form method="post" action="/save" class="panel">
+  return `${subnav("settings")}<form method="post" action="/save" class="panel">
 <section class="card">
 <h2>📊 Экзамен</h2>
 <label>Как часто проверять<select name="interval">${intervals.map((m) => `<option value="${m}"${sel(m, s.interval)}>${intervalLabel(m)}</option>`).join("")}</select></label>
@@ -1324,7 +1967,7 @@ function servicePanel(env, st, origin, result) {
   ];
   if (flags.length) rows.push(["Выключено в Green API", `<span class="bad">${flags.join(", ")}</span>`]);
   const hook = env.WEBHOOK_SECRET ? `${origin}/webhook/${env.WEBHOOK_SECRET}` : null;
-  return `${resultCard(result)}
+  return `${subnav("service")}${resultCard(result)}
 <section class="card">
 <h2>Проверка подключений</h2>
 <div>${rows.map(([k, val]) => `<div class="row"><span>${k}</span><span>${val}</span></div>`).join("")}</div>
@@ -1349,12 +1992,13 @@ ${chatList.length ? `<details class="card"><summary>Собранные чаты 
 
 async function dashboard(env, origin, { tab = "home", msg = null, result = null, analysis = null, orders = {} } = {}) {
   const st = await gatherStatus(env, origin);
-  const toast = msg ? `<div class="toast${msg.bad ? " bad" : ""}">${esc(msg.text)}</div>` : "";
+  const toast = msg ? `<div class="toast${msg.bad ? " bad" : ""}" id="flash">${esc(msg.text)}</div>` : "";
   return page("MQM watch", `
 <div class="top"><h1>MQM watch</h1><a href="/logout">Выйти</a></div>
 ${toast}
 <div class="panel" id="p-home">${homePanel(env, st, tab === "home" ? result : null)}</div>
 <div class="panel" id="p-orders">${ordersPanel(env, st, orders)}</div>
+<div class="panel" id="p-house">${housePanel(env, st, origin)}</div>
 <div class="panel" id="p-analysis">${analysisPanel(env, st, analysis)}</div>
 <div class="panel" id="p-settings">${settingsPanel(st)}</div>
 <div class="panel" id="p-service">${servicePanel(env, st, origin, tab === "service" ? result : null)}</div>`, { tab });
@@ -1472,6 +2116,13 @@ function flag(params, name, def) {
 export default {
   async scheduled(event, env) {
     const s = await loadSettings(env);
+    if (env.MQM_KV && tuyaReady(env)) {
+      try {
+        await runTimers(env, s);
+      } catch (e) {
+        console.log("ОШИБКА таймеров:", e.message);
+      }
+    }
     if (!s.enabled) return;
     const tick = Math.floor(event.scheduledTime / 60000);
     const res = await run(env, s, {
@@ -1504,9 +2155,30 @@ export default {
       });
     }
 
+    if (path.startsWith("/camera/")) {
+      const token = await cameraToken(env);
+      if (!token || path !== `/camera/${token}`) return new Response("Not found", { status: 404 });
+      let ev = Object.fromEntries(url.searchParams);
+      if (request.method === "POST") {
+        const type = request.headers.get("Content-Type") || "";
+        try {
+          if (type.includes("json")) ev = { ...ev, ...(await request.json()) };
+          else if (type.includes("form")) ev = { ...ev, ...Object.fromEntries([...(await request.formData())].map(([k, v]) => [k, String(v)])) };
+          else ev.text = ev.text || (await request.text());
+        } catch {
+          return Response.json({ ok: false, error: "непонятное тело запроса" }, { status: 400 });
+        }
+      }
+      try {
+        return Response.json({ ok: true, ...(await cameraEvent(env, ev)) });
+      } catch (e) {
+        return Response.json({ ok: false, error: e.message }, { status: 500 });
+      }
+    }
+
     if (path.startsWith("/webhook/")) {
       if (!env.WEBHOOK_SECRET || path !== `/webhook/${env.WEBHOOK_SECRET}`) {
-        ctx.waitUntil(noteWebhook(env, false, "пришёл на адрес с другим секретом — нажмите «Подключить вебхук в Green API»"));
+        ctx.waitUntil(noteWebhook(env, false, "пришёл на адрес с другим секретом — нажмите «Подключить вебхук в Green API»", true));
         return new Response("Not found", { status: 404 });
       }
       if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
@@ -1516,6 +2188,7 @@ export default {
       } catch {
         return new Response("Bad JSON", { status: 400 });
       }
+      ctx.waitUntil(handleCommand(env, body).catch((e) => console.log("ОШИБКА команды:", e.message)));
       try {
         await storeWebhook(env, body);
       } catch (e) {
@@ -1530,7 +2203,10 @@ export default {
     if (path === "/login" && request.method === "POST") {
       if (!env.RUN_KEY) return loginPage("В Cloudflare не задан секрет RUN_KEY");
       const key = String((await request.formData()).get("key") || "");
-      if (key !== env.RUN_KEY) return loginPage("Неверный пароль");
+      if (key !== env.RUN_KEY) {
+        await new Promise((r) => setTimeout(r, 1500)); // замедляет подбор пароля
+        return loginPage("Неверный пароль");
+      }
       return new Response(null, {
         status: 303,
         headers: {
@@ -1547,7 +2223,7 @@ export default {
       });
     }
 
-    if (!["/", "/save", "/toggle", "/action", "/analyze"].includes(path)) return new Response("Not found", { status: 404 });
+    if (!["/", "/save", "/toggle", "/action", "/analyze", "/house"].includes(path)) return new Response("Not found", { status: 404 });
     if (!(await isAuthed(request, env))) return loginPage();
     const back = (tab, text, bad = false) => new Response(null, {
       status: 303,
@@ -1567,6 +2243,16 @@ export default {
         return back("home", await toggleSetting(request, env));
       } catch (e) {
         return back("home", e.message, true);
+      }
+    }
+
+    if (path === "/house" && request.method === "POST") {
+      const form = await request.formData();
+      const tab = TABS.includes(String(form.get("back"))) ? String(form.get("back")) : "house";
+      try {
+        return back(tab, await houseAction(env, form));
+      } catch (e) {
+        return back(tab, e.message, true);
       }
     }
 
