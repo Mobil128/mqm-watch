@@ -586,8 +586,71 @@ async function storeWebhook(env, body) {
     [`chats/${chat}/count`]: { ".sv": { increment: 1 } },
   };
   if (sd.chatName) update[`chats/${chat}/name`] = sd.chatName;
+  const order = parseFuelOrder(messageText(body.messageData));
+  if (order && body.timestamp) {
+    update[`orders/${fbKey(body.idMessage)}`] = orderRecord(order, body.timestamp, sd.chatId, sd.chatName, sd.senderName || sd.senderContactName);
+  }
   await firebase(env, "PATCH", "/", update);
   return true;
+}
+
+// ---------------- Заказы топлива ----------------
+// «03-i saylı YDS / Ai92 - 18500 / Ai95 - 15000 / N/r: Nağı 055 793 93 30»:
+// номер АЗС, литры по видам топлива, кто принимает. Топливо приходит ночью.
+
+const FUEL_ORDER = ["Ai92", "Ai95", "Ai98", "Dizel"];
+const NIGHT_START_HOUR = 6; // заказ с 06:00 до 06:00 следующего дня — на ночь этого дня
+
+function parseFuelOrder(text) {
+  if (!text) return null;
+  const st = text.match(/(\d{1,3})[ \t]*-?[ \t]*[a-zəıiöüşçğ]*[ \t]*say[ıi]?l[ıi][ \t]*YDS/iu) || text.match(/YDS[ \t]*(?:№|N|#|-)?[ \t]*(\d{1,3})/i);
+  if (!st) return null;
+  const fuels = {};
+  for (const m of text.matchAll(/^[ \t]*(?:ai[ \t]*-?[ \t]*(\d{2,3})|(dizel|diesel|dt))[ \t]*[-–—:=][ \t]*(\d[\d .,]*)/gimu)) {
+    const name = m[1] ? `Ai${m[1]}` : "Dizel";
+    const liters = Number(m[3].replace(/\D/g, ""));
+    if (liters > 0) fuels[name] = (fuels[name] || 0) + liters;
+  }
+  if (!Object.keys(fuels).length) return null;
+  const r = text.match(/N[ \t]*\/[ \t]*r[ \t]*[:.\-]?[ \t]*(.+)$/im);
+  let receiver = null, phone = null;
+  if (r) {
+    const ph = r[1].match(/(?:\+?994|0)[ \t]*\(?\d{2}\)?[ \t-]*\d{3}[ \t-]*\d{2}[ \t-]*\d{2}/);
+    phone = ph ? ph[0].trim() : null;
+    receiver = (ph ? r[1].replace(ph[0], "") : r[1]).replace(/[\s,;:–-]+$/, "").trim() || null;
+  }
+  return { station: Number(st[1]), fuels, receiver, phone };
+}
+
+const nightOf = (ts) => ymd(new Date(ts * 1000 + BAKU_OFFSET_MS - NIGHT_START_HOUR * 3600000));
+
+function orderRecord(order, timestamp, chatId, chatName, senderName) {
+  return { ...order, timestamp, night: nightOf(timestamp), chatId, chatName: chatName || null, senderName: senderName || null };
+}
+
+// Разовый поиск заказов в уже собранных сообщениях.
+async function backfillOrders(env) {
+  const [messages, chats] = await Promise.all([firebase(env, "GET", "/messages"), firebase(env, "GET", "/chats")]);
+  const update = {};
+  for (const [chatKey, list] of Object.entries(messages || {})) {
+    const chat = (chats || {})[chatKey] || {};
+    for (const [id, m] of Object.entries(list || {})) {
+      const order = parseFuelOrder(m?.text);
+      if (order && m.timestamp) update[`orders/${id}`] = orderRecord(order, m.timestamp, chat.chatId || chatKey, chat.name, m.senderName);
+    }
+  }
+  const n = Object.keys(update).length;
+  if (n) await firebase(env, "PATCH", "/", update);
+  return n;
+}
+
+const liters = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+const fuelSort = (a, b) => (FUEL_ORDER.indexOf(a) + 1 || 99) - (FUEL_ORDER.indexOf(b) + 1 || 99) || a.localeCompare(b);
+
+function sumFuels(list) {
+  const out = {};
+  for (const o of list) for (const [f, l] of Object.entries(o.fuels || {})) out[f] = (out[f] || 0) + l;
+  return Object.entries(out).sort(([a], [b]) => fuelSort(a, b));
 }
 
 // Последний вебхук для страницы управления. Пишем не чаще раза в 10 минут
@@ -771,7 +834,12 @@ const LANGS = {
   tr: ["Türkçe", "Turkish"],
 };
 
+const GLOSSARY = `Context: "YDS" (yanacaqdoldurma stansiyası) is a fuel station, "03-i saylı YDS" means station No. 3.
+"Ai92", "Ai95", "Dizel" with a number are fuel orders in liters; "N/r" is the person who will receive the delivery, with a phone.
+Fuel is delivered at night. Refer to these as fuel orders for a station.`;
+
 const summaryPrompt = (lang) => `You analyze a WhatsApp chat. Messages may be in Azerbaijani, Russian or Turkish.
+${GLOSSARY}
 Write the whole answer in ${lang}, concisely, with these sections (translate the headings into ${lang}):
 1. In short — 2–3 sentences about the main points.
 2. Topics — a list.
@@ -782,6 +850,7 @@ Write the whole answer in ${lang}, concisely, with these sections (translate the
 Use only the chat and invent nothing; if a section is empty, say so in one word. Do not output phone numbers.`;
 
 const askPrompt = (lang) => `You answer a question about a WhatsApp chat. Messages may be in Azerbaijani, Russian or Turkish.
+${GLOSSARY}
 Answer in ${lang}, briefly, using only the chat. Where useful, say who wrote it and when.
 If the chat does not contain the answer, say so. Do not output phone numbers.`;
 
@@ -832,7 +901,7 @@ async function isAuthed(request, env) {
   return !!m && m[1] === (await authToken(env));
 }
 
-const TABS = ["home", "analysis", "settings", "service"];
+const TABS = ["home", "orders", "analysis", "settings", "service"];
 const INTERVALS = [5, 10, 15, 20, 30, 60, 120, 180, 360, 720, 1440];
 const intervalLabel = (m) => (m < 60 ? `каждые ${m} мин` : m === 60 ? "каждый час" : m === 1440 ? "раз в сутки" : `каждые ${m / 60} ч`);
 
@@ -895,7 +964,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:13px;background:var(--b
 code{font-size:13px;word-break:break-all}
 .hint{font-size:13px;color:var(--mut);margin:0}
 .savebar{position:sticky;bottom:calc(72px + env(safe-area-inset-bottom));z-index:1}
-.nav{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(4,1fr);padding:6px 4px calc(6px + env(safe-area-inset-bottom));z-index:2}
+.nav{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(5,1fr);padding:6px 4px calc(6px + env(safe-area-inset-bottom));z-index:2}
 .nav a{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:12px;color:var(--mut);text-decoration:none;padding:4px 0;border-radius:10px}
 .nav a[aria-current=page]{color:var(--acc);font-weight:600}
 .nav svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
@@ -908,6 +977,10 @@ h3{font-size:14px;margin:6px 0 0;color:var(--mut);font-weight:600}
 .tile span{font-size:12px;color:var(--mut)}
 .brow{display:grid;grid-template-columns:minmax(0,38%) 1fr 3ch;gap:8px;align-items:center;padding:3px 0;font-size:14px}
 .blabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brow.wide{grid-template-columns:5ch 1fr 8ch}
+a{color:var(--acc)}
+input[type=date]{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px;min-height:46px}
+.datebar{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
 .btrack{height:10px}
 .bfill{display:block;height:100%;background:var(--acc);border-radius:0 4px 4px 0}
 .bval{text-align:right;font-variant-numeric:tabular-nums;color:var(--mut)}
@@ -924,7 +997,7 @@ h3{font-size:14px;margin:6px 0 0;color:var(--mut);font-weight:600}
 // Вкладки, подтверждения и «Подождите…» на кнопках. Без JS все вкладки видны подряд.
 const CLIENT_JS = `
 (function(){
-  var tabs = ["home","analysis","settings","service"];
+  var tabs = ["home","orders","analysis","settings","service"];
   var start = document.body.getAttribute("data-tab") || "home";
   function show(t){
     if (tabs.indexOf(t) < 0) t = start;
@@ -934,7 +1007,10 @@ const CLIENT_JS = `
   }
   if (location.pathname !== "/") { history.replaceState(null, "", "/#" + start); show(start); }
   else {
-    if (location.search) history.replaceState(null, "", "/" + location.hash); // убрать ?msg, чтобы не всплывало при обновлении
+    if (/[?&](msg|bad)=/.test(location.search)) { // убрать сообщение, чтобы не всплывало при обновлении; фильтры оставить
+      var q = new URLSearchParams(location.search); q.delete("msg"); q.delete("bad");
+      var qs = q.toString(); history.replaceState(null, "", "/" + (qs ? "?" + qs : "") + location.hash);
+    }
     show(location.hash.slice(1) || start);
   }
   window.addEventListener("hashchange", function(){ show(location.hash.slice(1)); });
@@ -955,8 +1031,9 @@ const ICONS = {
   analysis: '<path d="M3 21h18M6 17v-6M11 17V5M16 17v-9M21 17v-3"/>',
   settings: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
   service: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  orders: '<path d="M4 21V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v16M3 21h12M7 8h4M14 9h2a2 2 0 0 1 2 2v5a1.5 1.5 0 0 0 3 0V8l-3-3"/>',
 };
-const TAB_NAMES = { home: "Главная", analysis: "Анализ", settings: "Настройки", service: "Сервис" };
+const TAB_NAMES = { home: "Главная", orders: "Заказы", analysis: "Анализ", settings: "Настройки", service: "Сервис" };
 
 function page(title, body, { tab = "home", status = 200, nav = true } = {}) {
   const navHtml = nav
@@ -1006,7 +1083,7 @@ async function gatherStatus(env, origin) {
   const kv = env.MQM_KV;
   const c = config(env, s);
   const safe = (p) => p.then((v) => ({ v }), (e) => ({ e: e.message }));
-  const [last, state, weatherDate, lastHook, chats, gState, gSettings] = await Promise.all([
+  const [last, state, weatherDate, lastHook, chats, gState, gSettings, orders] = await Promise.all([
     kv ? kv.get("last_run", "json") : null,
     kv ? kv.get("state", "json") : null,
     kv ? kv.get("weather_date") : null,
@@ -1014,7 +1091,9 @@ async function gatherStatus(env, origin) {
     firebaseReady(env) ? safe(firebase(env, "GET", "/chats")) : { e: null },
     safe(apiCall(c, "getStateInstance")),
     safe(apiCall(c, "getSettings")),
+    firebaseReady(env) ? safe(firebase(env, "GET", "/orders")) : { e: null },
   ]);
+  const orderList = orders.v ? Object.values(orders.v || {}).filter((o) => o && o.night).sort((a, b) => b.timestamp - a.timestamp) : [];
   const chatList = chats.v ? Object.values(chats.v || {}).sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0)) : [];
   const want = env.WEBHOOK_SECRET ? `${origin}/webhook/${env.WEBHOOK_SECRET}` : null;
   let hookWhere = null;
@@ -1022,7 +1101,7 @@ async function gatherStatus(env, origin) {
     const url = gSettings.v.webhookUrl;
     hookWhere = !url ? "none" : url === want ? "ours" : "other";
   }
-  return { s, kv, last, state, weatherDate, lastHook, chats, chatList, gState, gSettings, hookWhere };
+  return { s, kv, last, state, weatherDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList };
 }
 
 function problems(env, st) {
@@ -1078,12 +1157,86 @@ ${toggleForm("weather_enabled", s.weather_enabled, "Утренний прогн�
 ${actionButton("home", "weather", "🌦 Прислать прогноз сейчас", { confirmText: "Отправить прогноз погоды в группу сейчас?" })}
 </section>
 
+${ordersCard(st)}
+
 <section class="card">
 <h2>💬 Сообщения</h2>
 <p class="meta">${firebaseReady(env) ? `Собрано ${chatList.length} чатов, ${total} сообщений.` : "Сбор не настроен — см. «Сервис»."}
 ${lastHook ? ` Последнее: ${ago(lastHook.time)} ${lastHook.ok ? `<span class="ok">✓</span>` : `<span class="bad">с ошибкой</span>`}.` : ""}</p>
 <a class="btn" href="#analysis">📈 Открыть анализ</a>
 </section>`;
+}
+
+function ordersCard(st) {
+  const tonight = nightOf(Date.now() / 1000);
+  const list = st.orderList.filter((o) => o.night === tonight);
+  const totals = sumFuels(list);
+  return `<section class="card">
+<h2>⛽ Заказы на эту ночь</h2>
+${list.length
+    ? `<div class="chips">${totals.map(([f, l]) => `<span class="chipx"><b>${esc(f)}</b> ${liters(l)} л</span>`).join("")}</div>
+<p class="meta">${list.length} заказ(ов): ${[...new Set(list.map((o) => o.station))].sort((a, b) => a - b).map((n) => `АЗС №${n}`).join(", ")}</p>`
+    : `<p class="meta">Заказов на эту ночь пока нет.</p>`}
+<a class="btn" href="#orders">⛽ Все заказы</a>
+</section>`;
+}
+
+function ordersPanel(env, st, q = {}) {
+  if (!firebaseReady(env)) return `<section class="card"><h2>⛽ Заказы</h2><p class="meta">Сначала нужно настроить сбор сообщений — см. «Сервис».</p></section>`;
+  const tonight = nightOf(Date.now() / 1000);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(q.date || "") ? q.date : tonight;
+  const span = [1, 7, 30].includes(Number(q.span)) ? Number(q.span) : 1;
+  const from = ymd(new Date(Date.parse(date + "T00:00:00Z") - (span - 1) * 86400000));
+  const list = st.orderList.filter((o) => o.night >= from && o.night <= date);
+  const totals = sumFuels(list);
+  const title = span === 1 ? (date === tonight ? "Эта ночь" : `Ночь ${date.slice(8)}.${date.slice(5, 7)}`) : `${span} ночей до ${date.slice(8)}.${date.slice(5, 7)}`;
+
+  const form = `<form class="card" method="get" action="/">
+<input type="hidden" name="tab" value="orders">
+<div class="datebar">
+<label>Ночь<input type="date" name="date" value="${date}" max="${tonight}" onchange="this.form.requestSubmit()"></label>
+<a class="btn" href="/?tab=orders" style="min-height:46px">Сегодня</a>
+</div>
+<div class="seg" style="grid-template-columns:repeat(3,1fr)">${[[1, "Ночь"], [7, "7 ночей"], [30, "30 ночей"]].map(([v, l]) => `<label><input type="radio" name="span" value="${v}"${checked(v === span)} onchange="this.form.requestSubmit()"><span>${l}</span></label>`).join("")}</div>
+<noscript><button class="btn">Показать</button></noscript>
+</form>`;
+
+  if (!list.length) return form + `<section class="card"><h2>${title}</h2><p class="meta">Заказов нет.</p>
+<p class="hint">Бот узнаёт заказы по виду «03-i saylı YDS / Ai92 - 18500 / N/r: имя телефон». Если заказы были до подключения — «Сервис» → «Найти заказы в собранных сообщениях».</p></section>`;
+
+  const byStation = {};
+  for (const o of list) (byStation[o.station] ||= []).push(o);
+  const stationRows = Object.entries(byStation).sort(([a], [b]) => a - b)
+    .map(([n, os]) => `<div class="row"><span>АЗС №${n} <small>· ${os.length}</small></span><span>${sumFuels(os).map(([f, l]) => `${esc(f)} ${liters(l)}`).join(" · ")}</span></div>`).join("");
+
+  let nights = "";
+  if (span > 1) {
+    const perNight = {};
+    for (const o of list) perNight[o.night] = (perNight[o.night] || 0) + Object.values(o.fuels || {}).reduce((x, y) => x + y, 0);
+    const rows = Object.entries(perNight).sort(([a], [b]) => (a < b ? 1 : -1)).map(([d, l]) => [`${d.slice(8)}.${d.slice(5, 7)}`, l]);
+    const max = Math.max(...rows.map(([, l]) => l));
+    nights = `<h3>Литров по ночам</h3>` + rows.map(([d, l]) => `<div class="brow wide" title="${d}: ${liters(l)} л"><span class="blabel">${d}</span><span class="btrack"><span class="bfill" style="width:${Math.max(2, Math.round(l / max * 100))}%"></span></span><span class="bval">${liters(l)}</span></div>`).join("");
+  }
+
+  const cards = list.map((o) => {
+    const t = new Date(o.timestamp * 1000 + BAKU_OFFSET_MS);
+    const tel = o.phone ? o.phone.replace(/[^\d+]/g, "") : "";
+    return `<section class="card">
+<h2>АЗС №${o.station}<span class="meta">${dm(t)} ${hm(t)}</span></h2>
+<div class="chips">${Object.entries(o.fuels || {}).sort(([a], [b]) => fuelSort(a, b)).map(([f, l]) => `<span class="chipx"><b>${esc(f)}</b> ${liters(l)} л</span>`).join("")}</div>
+${o.receiver || o.phone ? `<p class="meta">Принимает: <b style="color:var(--fg)">${esc(o.receiver || "—")}</b>${o.phone ? ` · <a href="tel:${esc(tel)}">📞 ${esc(o.phone)}</a>` : ""}</p>` : ""}
+<p class="hint">${esc(o.senderName || "")}${o.chatName ? ` · ${esc(o.chatName)}` : ""}</p>
+</section>`;
+  }).join("");
+
+  return `${form}
+<section class="card">
+<h2>${title}<span class="meta">${list.length} заказ(ов)</span></h2>
+<div class="tiles" style="grid-template-columns:repeat(${Math.min(3, totals.length)},1fr)">${totals.map(([f, l]) => `<div class="tile"><b>${liters(l)}</b><span>${esc(f)}, л</span></div>`).join("")}</div>
+<div>${stationRows}</div>
+${nights}
+</section>
+${cards}`;
 }
 
 function analysisPanel(env, st, analysis) {
@@ -1182,6 +1335,7 @@ ${actionButton("service", "webhook", "🔗 Подключить вебхук в 
 <section class="card">
 <h2>Действия</h2>
 <div class="btns">
+${actionButton("service", "orders", "⛽ Найти заказы в собранных сообщениях")}
 ${actionButton("service", "dump", "🔍 Что бот видит на странице экзамена")}
 ${actionButton("service", "clean", "🧹 Удалить старые сообщения бота", { cls: "danger", confirmText: "Удалить у всех старые сообщения бота в группе?" })}
 ${actionButton("service", "reset", "↺ Сбросить сохранённые баллы", { cls: "danger", confirmText: "Сбросить сохранённые баллы? Следующая проверка запомнит текущие без сообщения." })}
@@ -1193,13 +1347,14 @@ ${chatList.length ? `<details class="card"><summary>Собранные чаты 
 <p class="hint">Расписание в Cloudflare — <code>* * * * *</code> (каждую минуту); как часто проверять экзамен, задаётся в «Настройках».</p>`;
 }
 
-async function dashboard(env, origin, { tab = "home", msg = null, result = null, analysis = null } = {}) {
+async function dashboard(env, origin, { tab = "home", msg = null, result = null, analysis = null, orders = {} } = {}) {
   const st = await gatherStatus(env, origin);
   const toast = msg ? `<div class="toast${msg.bad ? " bad" : ""}">${esc(msg.text)}</div>` : "";
   return page("MQM watch", `
 <div class="top"><h1>MQM watch</h1><a href="/logout">Выйти</a></div>
 ${toast}
 <div class="panel" id="p-home">${homePanel(env, st, tab === "home" ? result : null)}</div>
+<div class="panel" id="p-orders">${ordersPanel(env, st, orders)}</div>
 <div class="panel" id="p-analysis">${analysisPanel(env, st, analysis)}</div>
 <div class="panel" id="p-settings">${settingsPanel(st)}</div>
 <div class="panel" id="p-service">${servicePanel(env, st, origin, tab === "service" ? result : null)}</div>`, { tab });
@@ -1287,6 +1442,14 @@ async function doAction(env, action, origin) {
   if (action === "webhook") {
     try {
       return { ok: true, summary: "адрес прописан, Green API может пару минут перезапускаться", log: await connectWebhook(env, origin) };
+    } catch (e) {
+      return { ok: false, summary: e.message };
+    }
+  }
+  if (action === "orders") {
+    try {
+      const n = await backfillOrders(env);
+      return { ok: true, summary: n ? `найдено и сохранено заказов: ${n} — см. вкладку «Заказы»` : "заказов в собранных сообщениях не нашлось" };
     } catch (e) {
       return { ok: false, summary: e.message };
     }
@@ -1429,6 +1592,11 @@ export default {
     }
 
     const text = url.searchParams.get("msg");
-    return dashboard(env, url.origin, { msg: text ? { text, bad: url.searchParams.get("bad") === "1" } : null });
+    const q = url.searchParams;
+    return dashboard(env, url.origin, {
+      tab: TABS.includes(q.get("tab")) ? q.get("tab") : "home",
+      msg: text ? { text, bad: q.get("bad") === "1" } : null,
+      orders: { date: q.get("date"), span: q.get("span") },
+    });
   },
 };
