@@ -522,7 +522,10 @@ function secretsReport(env) {
       notes.push(`<span class="bad">FIREBASE_SERVICE_ACCOUNT — не JSON</span>`);
     }
   }
-  return notes.length ? notes.join("<br>") : `<span class="ok">все на месте</span>`;
+  if (!notes.length) return `<span class="ok">все на месте</span>`;
+  // имена (не значения) всего, что видит воркер: в кавычках заметны лишние пробелы
+  const names = Object.keys(env).sort().map((k) => esc(JSON.stringify(k))).join(", ");
+  return notes.join("<br>") + `<br><small>Воркер видит: ${names}</small>`;
 }
 
 const firebaseReady = (env) => !!(env.FIREBASE_DB_URL && (env.FIREBASE_SECRET || env.FIREBASE_SERVICE_ACCOUNT));
