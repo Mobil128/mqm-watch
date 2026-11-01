@@ -1318,6 +1318,25 @@ async function handleCommand(env, body) {
 const CAMERA_COOLDOWNS = [0, 1, 5, 15, 30, 60];
 const cameraToken = async (env) => (env.WEBHOOK_SECRET ? (await sha256Hex("camera:" + env.WEBHOOK_SECRET)).slice(0, 24) : null);
 
+// Снимок из письма камеры: base64 из сценария Gmail → файл в WhatsApp с текстом тревоги в подписи.
+const MAX_CAMERA_IMAGE = 4_000_000; // байт; больше — шлём только текст
+
+async function sendCameraPhoto(env, s, chatId, caption, ev) {
+  const c = config(env, s);
+  const bytes = Uint8Array.from(atob(String(ev.image)), (ch) => ch.charCodeAt(0));
+  if (!bytes.length || bytes.length > MAX_CAMERA_IMAGE) throw new Error("снимок пустой или слишком большой");
+  const type = /^image\/(jpeg|png|gif|webp)$/i.test(String(ev.imageType || "")) ? String(ev.imageType) : "image/jpeg";
+  const name = String(ev.imageName || "snapshot.jpg").replace(/[^\w.-]/g, "_").slice(0, 60) || "snapshot.jpg";
+  const form = new FormData();
+  form.append("chatId", chatId || c.chat);
+  form.append("caption", caption);
+  form.append("file", new Blob([bytes], { type }), name);
+  const res = await fetch(`${c.api}/waInstance${c.id}/sendFileByUpload/${c.token}`, { method: "POST", body: form });
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`Green API sendFileByUpload ${res.status}: ${raw}`);
+  c.log("Green API (снимок):", raw);
+}
+
 async function cameraEvent(env, ev) {
   const s = await loadSettings(env);
   const now = Date.now();
@@ -1329,7 +1348,17 @@ async function cameraEvent(env, ev) {
     const last = (await env.MQM_KV.get("camera_last", "json")) || {};
     if (s.camera_cooldown && now - (last[camera] || 0) < s.camera_cooldown * 60000) reason = "пауза между тревогами этой камеры";
     else {
-      await sendTo(env, s, s.camera_chat || null, `🚨 ${camera}${text ? `\n${text}` : ""}\n🕒 ${bakuTime(now)}`);
+      const caption = `🚨 ${camera}${text ? `\n${text}` : ""}\n🕒 ${bakuTime(now)}`;
+      let photo = false;
+      if (ev.image) {
+        try {
+          await sendCameraPhoto(env, s, s.camera_chat || null, caption, ev);
+          photo = true;
+        } catch (e) {
+          console.log("Снимок не отправлен, шлю текстом:", e.message);
+        }
+      }
+      if (!photo) await sendTo(env, s, s.camera_chat || null, caption);
       last[camera] = now;
       await env.MQM_KV.put("camera_last", JSON.stringify(last));
       forwarded = true;
@@ -1344,16 +1373,29 @@ async function cameraEvent(env, ev) {
 
 const gmailScript = (camUrl) => `const URL = "${camUrl}";
 const QUERY = "is:unread from:(АДРЕС_КАМЕРЫ)";
+function bodyText(m) {
+  const t = m.getPlainBody();
+  if (t && t.trim()) return t;
+  return m.getBody().replace(/<style[\\s\\S]*?<\\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\\s+/g, " ").trim();
+}
 function forwardCamera() {
   for (const thread of GmailApp.search(QUERY, 0, 20)) {
     for (const m of thread.getMessages()) {
       if (!m.isUnread()) continue;
-      UrlFetchApp.fetch(URL, { method: "post", contentType: "application/json",
-        payload: JSON.stringify({ camera: m.getFrom(), title: m.getSubject(), text: m.getPlainBody().slice(0, 300) }) });
+      const from = m.getFrom();
+      const body = { camera: from.replace(/<[^>]*>/g, "").replace(/"/g, "").trim() || from, title: m.getSubject(), text: bodyText(m).slice(0, 300) };
+      const img = m.getAttachments().find(function (a) { return /^image\\//.test(a.getContentType()); });
+      if (img && img.getBytes().length < 4000000) {
+        body.image = Utilities.base64Encode(img.getBytes());
+        body.imageName = img.getName();
+        body.imageType = img.getContentType();
+      }
+      UrlFetchApp.fetch(URL, { method: "post", contentType: "application/json", payload: JSON.stringify(body) });
       m.markRead();
     }
   }
-}`;
+}
+`;
 
 // ---------------- Дом: страница ----------------
 
