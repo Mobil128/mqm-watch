@@ -1373,7 +1373,7 @@ async function cameraEvent(env, ev) {
       let sentPhoto = false;
       if (ev.image) {
         try {
-          await sendCameraPhoto(env, s, s.camera_chat || null, caption, ev);
+          await sendCameraPhoto(env, s, s.camera_chat || null, `🕒 ${bakuTime(now)}`, ev);
           sentPhoto = true;
           photo = "sent";
         } catch (e) {
