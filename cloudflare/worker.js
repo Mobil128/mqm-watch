@@ -936,7 +936,8 @@ function statsHtml(list, hours) {
 }
 
 function transcript(list) {
-  const lines = list.filter((m) => m.direction !== "outgoing_api").map((m) => {
+  // без сообщений бота и команд реле («!nasos aç») — для разбора это шум
+  const lines = list.filter((m) => m.direction !== "outgoing_api" && !/^\s*!/.test(m.text || "")).map((m) => {
     const t = new Date(m.timestamp * 1000 + BAKU_OFFSET_MS);
     const kind = TYPE_NAMES[m.type];
     const text = (m.text || "").replace(/\s+/g, " ").trim();
