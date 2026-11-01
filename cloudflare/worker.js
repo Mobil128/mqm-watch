@@ -1321,20 +1321,37 @@ const cameraToken = async (env) => (env.WEBHOOK_SECRET ? (await sha256Hex("camer
 // Снимок из письма камеры: base64 из сценария Gmail → файл в WhatsApp с текстом тревоги в подписи.
 const MAX_CAMERA_IMAGE = 4_000_000; // байт; больше — шлём только текст
 
+// Тип картинки определяем по первым байтам: камеры нередко шлют снимок с типом application/octet-stream.
+function sniffImage(b) {
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return ["image/jpeg", "jpg"];
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return ["image/png", "png"];
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return ["image/gif", "gif"];
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return ["image/webp", "webp"];
+  return null;
+}
+
 async function sendCameraPhoto(env, s, chatId, caption, ev) {
   const c = config(env, s);
-  const bytes = Uint8Array.from(atob(String(ev.image)), (ch) => ch.charCodeAt(0));
-  if (!bytes.length || bytes.length > MAX_CAMERA_IMAGE) throw new Error("снимок пустой или слишком большой");
-  const type = /^image\/(jpeg|png|gif|webp)$/i.test(String(ev.imageType || "")) ? String(ev.imageType) : "image/jpeg";
-  const name = String(ev.imageName || "snapshot.jpg").replace(/[^\w.-]/g, "_").slice(0, 60) || "snapshot.jpg";
+  let bytes;
+  try {
+    bytes = Uint8Array.from(atob(String(ev.image)), (ch) => ch.charCodeAt(0));
+  } catch {
+    throw new Error("снимок пришёл в неверном виде (не base64)");
+  }
+  if (!bytes.length) throw new Error("снимок пустой");
+  if (bytes.length > MAX_CAMERA_IMAGE) throw new Error(`снимок больше ${MAX_CAMERA_IMAGE / 1e6} МБ`);
+  const kind = sniffImage(bytes);
+  if (!kind) throw new Error("вложение не похоже на картинку (не jpg/png/gif/webp)");
+  let name = String(ev.imageName || "snapshot").replace(/[^\w.-]/g, "_").slice(0, 60) || "snapshot";
+  if (!/\.(jpe?g|png|gif|webp)$/i.test(name)) name += "." + kind[1];
   const form = new FormData();
   form.append("chatId", chatId || c.chat);
   form.append("caption", caption);
-  form.append("file", new Blob([bytes], { type }), name);
+  form.append("fileName", name);
+  form.append("file", new Blob([bytes], { type: kind[0] }), name);
   const res = await fetch(`${c.api}/waInstance${c.id}/sendFileByUpload/${c.token}`, { method: "POST", body: form });
   const raw = await res.text();
-  if (!res.ok) throw new Error(`Green API sendFileByUpload ${res.status}: ${raw}`);
-  c.log("Green API (снимок):", raw);
+  if (!res.ok) throw new Error(`Green API ${res.status}: ${raw.slice(0, 150)}`);
 }
 
 async function cameraEvent(env, ev) {
@@ -1343,32 +1360,39 @@ async function cameraEvent(env, ev) {
   const camera = String(ev.camera || ev.app || "Kamera").replace(/\s+/g, " ").trim().slice(0, 80) || "Kamera";
   const text = [ev.title, ev.text].filter((x) => x && String(x).trim()).map(String).join(" — ").replace(/\s+/g, " ").trim().slice(0, 500);
   let forwarded = false, reason = "";
+  // состояние снимка: "" — о снимках ничего не известно (старый скрипт или другой источник), noimage — в письме снимка нет,
+  // received — получен, но не пересылался, sent — ушёл в WhatsApp, failed — отправить не удалось (текст всё равно ушёл)
+  let photo = ev.image ? "received" : String(ev.script || "") === "2" ? "noimage" : "";
+  let photoError = "";
   if (!s.camera_forward) reason = "пересылка в WhatsApp выключена";
   else {
     const last = (await env.MQM_KV.get("camera_last", "json")) || {};
     if (s.camera_cooldown && now - (last[camera] || 0) < s.camera_cooldown * 60000) reason = "пауза между тревогами этой камеры";
     else {
       const caption = `🚨 ${camera}${text ? `\n${text}` : ""}\n🕒 ${bakuTime(now)}`;
-      let photo = false;
+      let sentPhoto = false;
       if (ev.image) {
         try {
           await sendCameraPhoto(env, s, s.camera_chat || null, caption, ev);
-          photo = true;
+          sentPhoto = true;
+          photo = "sent";
         } catch (e) {
+          photo = "failed";
+          photoError = e.message.slice(0, 200);
           console.log("Снимок не отправлен, шлю текстом:", e.message);
         }
       }
-      if (!photo) await sendTo(env, s, s.camera_chat || null, caption);
+      if (!sentPhoto) await sendTo(env, s, s.camera_chat || null, caption);
       last[camera] = now;
       await env.MQM_KV.put("camera_last", JSON.stringify(last));
       forwarded = true;
     }
   }
   if (firebaseReady(env)) {
-    await firebase(env, "PATCH", "/", { [`camera_events/${now}_${Math.random().toString(36).slice(2, 8)}`]: { time: now, camera, text, forwarded } })
+    await firebase(env, "PATCH", "/", { [`camera_events/${now}_${Math.random().toString(36).slice(2, 8)}`]: { time: now, camera, text, forwarded, photo, photoError: photoError || null } })
       .catch((e) => console.log("Тревога не сохранена:", e.message));
   }
-  return { forwarded, reason };
+  return { forwarded, reason, photo, ...(photoError ? { photoError } : {}) };
 }
 
 const gmailScript = (camUrl) => `const URL = "${camUrl}";
@@ -1378,18 +1402,25 @@ function bodyText(m) {
   if (t && t.trim()) return t;
   return m.getBody().replace(/<style[\\s\\S]*?<\\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\\s+/g, " ").trim();
 }
+function isImage(a) {
+  if (/^image\\//.test(a.getContentType()) || /\\.(jpe?g|png|gif|webp|bmp)$/i.test(a.getName() || "")) return true;
+  const b = a.getBytes();
+  return b.length > 3 && b[0] === -1 && b[1] === -40 && b[2] === -1;
+}
 function forwardCamera() {
   for (const thread of GmailApp.search(QUERY, 0, 20)) {
     for (const m of thread.getMessages()) {
       if (!m.isUnread()) continue;
       const from = m.getFrom();
-      const body = { camera: from.replace(/<[^>]*>/g, "").replace(/"/g, "").trim() || from, title: m.getSubject(), text: bodyText(m).slice(0, 300) };
-      const img = m.getAttachments().find(function (a) { return /^image\\//.test(a.getContentType()); });
+      const body = { script: 2, camera: from.replace(/<[^>]*>/g, "").replace(/"/g, "").trim() || from, title: m.getSubject(), text: bodyText(m).slice(0, 300) };
+      const files = m.getAttachments();
+      const img = files.find(isImage);
       if (img && img.getBytes().length < 4000000) {
         body.image = Utilities.base64Encode(img.getBytes());
         body.imageName = img.getName();
         body.imageType = img.getContentType();
       }
+      Logger.log("вложений: " + files.length + ", снимок: " + (img ? img.getName() + " " + img.getBytes().length + " байт" : "нет"));
       UrlFetchApp.fetch(URL, { method: "post", contentType: "application/json", payload: JSON.stringify(body) });
       m.markRead();
     }
@@ -1440,6 +1471,22 @@ function homeHouseCard(env, st) {
     return switchRows(dev, live.v, h.timers, "home");
   }).join("");
   return `<section class="card"><h2>🏠 Дом</h2>${h.tokenError ? `<p class="bad">${esc(h.tokenError)}</p>` : rows}<a class="btn" href="#house">Всё о доме</a></section>`;
+}
+
+function photoNote(e) {
+  if (e.photo === "sent") return `<span class="ok">📷 снимок отправлен</span>`;
+  if (e.photo === "failed") return `<span class="bad">📷 снимок не ушёл: ${esc(e.photoError || "ошибка")}</span>`;
+  if (e.photo === "received") return "📷 снимок получен";
+  if (e.photo === "noimage") return "в письме не нашлось снимка";
+  return "";
+}
+
+// Если свежая тревога пришла без сведений о снимке — скорее всего, в Gmail остался код старой версии.
+function oldScriptHint(events) {
+  const last = events.find((e) => e.camera !== "Test");
+  return last && !last.photo
+    ? `<p class="hint">О снимках нет данных. Если камеры подключены через Gmail, скопируйте код скрипта заново (ниже, «Как подключить камеры»): старая версия снимки не отправляет.</p>`
+    : "";
 }
 
 function housePanel(env, st, origin) {
@@ -1530,7 +1577,7 @@ ${ready && !h.devs.length ? "" : `<details><summary>Как это работае
 <section class="card">
 <h2>Последние тревоги</h2>
 ${h.camError ? `<p class="bad">${esc(h.camError)}</p>` : h.camEvents.length
-    ? h.camEvents.map((e) => `<div class="row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small></span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("")
+    ? h.camEvents.map((e) => `<div class="row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small><br><small>${photoNote(e)}</small></span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("") + oldScriptHint(h.camEvents)
     : `<p class="meta">Пока не было.${firebaseReady(env) ? "" : " Список хранится в Firebase — он не настроен."}</p>`}
 <form method="post" action="/house"><input type="hidden" name="do" value="camera_test"><button class="btn" data-confirm="Отправить тестовую тревогу${s.camera_forward ? " в WhatsApp" : ""}?">🧪 Тестовая тревога</button></form>
 </section>
