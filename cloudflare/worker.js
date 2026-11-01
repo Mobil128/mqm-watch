@@ -935,14 +935,14 @@ function statsHtml(list, hours) {
   return html;
 }
 
-function transcript(list) {
+function transcript(list, multi = false) {
   // без сообщений бота и команд реле («!nasos aç») — для разбора это шум
   const lines = list.filter((m) => m.direction !== "outgoing_api" && !/^\s*!/.test(m.text || "")).map((m) => {
     const t = new Date(m.timestamp * 1000 + BAKU_OFFSET_MS);
     const kind = TYPE_NAMES[m.type];
     const text = (m.text || "").replace(/\s+/g, " ").trim();
     const body = kind === "текст" || kind === "ответ" ? text : `<${kind || m.type || "сообщение"}${text ? ": " + text : ""}>`;
-    return `[${dm(t)} ${hm(t)}] ${who(m)}: ${body}`;
+    return `[${dm(t)} ${hm(t)}] ${multi ? `(${m.chatName}) ` : ""}${who(m)}: ${body}`;
   });
   let total = 0, from = lines.length;
   while (from > 0 && total + lines[from - 1].length + 1 <= GEMINI_MAX_CHARS) total += lines[--from].length + 1;
@@ -1021,35 +1021,52 @@ ${GLOSSARY}
 Answer in ${lang}, briefly, using only the chat. Where useful, say who wrote it and when.
 If the chat does not contain the answer, say so. Do not output phone numbers.`;
 
+const MAX_ANALYZE_CHATS = 20;
+
 async function analyze(env, form) {
   const s = await loadSettings(env);
   const a = {
-    chat: String(form.get("chat") || ""),
+    chats: [...new Set(form.getAll("chat").map(String).filter(Boolean))].slice(0, MAX_ANALYZE_CHATS),
     hours: Number(form.get("period")) in PERIODS ? Number(form.get("period")) : 24,
     question: String(form.get("question") || "").trim().slice(0, 1000),
     action: String(form.get("do") || "stats"),
     lang: LANGS[String(form.get("lang"))] ? String(form.get("lang")) : s.gemini_lang,
   };
-  if (!a.chat) return { a, ok: false, html: "Выберите чат." };
+  if (!a.chats.length) return { a, ok: false, html: "<p>Отметьте хотя бы один чат.</p>" };
   const chats = (await firebase(env, "GET", "/chats")) || {};
-  const chat = chats[fbKey(a.chat)];
-  const name = chat?.name || a.chat;
+  const nameOf = (id) => chats[fbKey(id)]?.name || id;
   const since = Math.floor(Date.now() / 1000) - a.hours * 3600;
-  const { list, indexed } = await loadMessages(env, a.chat, since);
-  const head = `<h2>${esc(name)} <span class="meta">за ${PERIODS[a.hours]}</span></h2>`;
-  const hint = indexed ? "" : `<details><summary>Совет: индекс в Firebase</summary><pre>${esc(FIREBASE_INDEX_HINT)}</pre></details>`;
+  const loaded = await Promise.all(a.chats.map((id) => loadMessages(env, id, since)));
+  const list = loaded.flatMap(({ list: l }, i) => l.map((m) => ({ ...m, chatName: nameOf(a.chats[i]) })))
+    .sort((x, y) => x.timestamp - y.timestamp);
+  const multi = a.chats.length > 1;
+  const names = a.chats.map(nameOf);
+  const title = multi ? `${a.chats.length} чата(ов)` : names[0];
+  const head = `<h2>${esc(title)} <span class="meta">за ${PERIODS[a.hours]}</span></h2>`
+    + (multi ? `<p class="hint">${names.map(esc).join(" · ")}</p>` : "");
+  const hint = loaded.every((x) => x.indexed) ? "" : `<details><summary>Совет: индекс в Firebase</summary><pre>${esc(FIREBASE_INDEX_HINT)}</pre></details>`;
 
-  if (a.action === "stats") return { a, ok: true, html: head + statsHtml(list, a.hours) + hint };
+  if (a.action === "stats") {
+    let html = statsHtml(list, a.hours);
+    if (multi && list.length) {
+      const per = names.map((n, i) => [n, loaded[i].list.length]).sort((x, y) => y[1] - x[1]);
+      html = `<h3>По чатам</h3>${barRows(per, Math.max(1, per[0][1]))}` + html;
+    }
+    return { a, ok: true, html: head + html + hint };
+  }
 
-  const tr = transcript(list);
+  const tr = transcript(list, multi);
   if (!tr.used) return { a, ok: true, html: head + "<p>За этот период сообщений от участников нет.</p>" + hint };
-  if (a.action === "ask" && !a.question) return { a, ok: false, html: head + "Напишите вопрос в поле «Вопрос»." };
+  if (a.action === "ask" && !a.question) return { a, ok: false, html: head + "<p>Напишите вопрос в поле «Вопрос».</p>" };
   const lang = LANGS[a.lang][1];
   const intro = a.action === "ask" ? `${askPrompt(lang)}\n\nQuestion: ${a.question}` : summaryPrompt(lang);
-  const { text: answer, model } = await gemini(env, s.gemini_model, `${intro}\n\nChat: "${name}", period: last ${a.hours} hours.\nMessages:\n${tr.text}`);
+  const scope = multi
+    ? `Chats: ${names.map((n) => `"${n}"`).join(", ")}. Messages from all of them are merged by time; the chat name is in parentheses. Say which chat something comes from when it matters.`
+    : `Chat: "${names[0]}".`;
+  const { text: answer, model } = await gemini(env, s.gemini_model, `${intro}\n\n${scope}\nPeriod: last ${a.hours} hours.\nMessages:\n${tr.text}`);
   const note = tr.used < tr.all ? `<p class="hint">Gemini получил последние ${tr.used} из ${tr.all} сообщений — остальные не поместились.</p>` : "";
-  const title = a.action === "ask" ? `<p class="hint">Вопрос: ${esc(a.question)}</p>` : "";
-  return { a, ok: true, html: head + title + `<div class="md">${mdLite(answer)}</div>` + note
+  const q = a.action === "ask" ? `<p class="hint">Вопрос: ${esc(a.question)}</p>` : "";
+  return { a, ok: true, html: head + q + `<div class="md">${mdLite(answer)}</div>` + note
     + `<p class="hint">${esc(LANGS[a.lang][0])} · модель ${esc(model)}${model !== s.gemini_model ? " (запасная — основная была перегружена)" : ""} · сообщений: ${tr.used}</p>` + hint };
 }
 
@@ -1728,6 +1745,14 @@ input[type=date]{width:100%;padding:10px 12px;border:1px solid var(--line);borde
 .subnav{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px}
 .subnav a{text-align:center;padding:8px;border-radius:9px;text-decoration:none;color:var(--fg);font-size:15px}
 .subnav a[aria-current=page]{background:var(--acc-soft);color:var(--acc);font-weight:600}
+.pickhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.linkbtn{background:none;border:0;padding:0;color:var(--acc);font:inherit;font-size:14px;cursor:pointer}
+.chatpick{max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+.pick{display:flex;align-items:center;gap:10px;padding:10px 12px;border-top:1px solid var(--line);color:var(--fg);font-size:15px;cursor:pointer}
+.pick:first-child{border-top:0}
+.pick input{width:20px;height:20px;accent-color:var(--acc);flex:none}
+.pick span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pick small{color:var(--mut)}
 @media (prefers-reduced-motion:reduce){.switch input,.switch input::after{transition:none}}
 `;
 
@@ -1756,6 +1781,12 @@ const CLIENT_JS = `
     show(location.hash.slice(1));
   });
   document.addEventListener("click", function(e){
+    var pick = e.target.closest && e.target.closest("[data-check]");
+    if (pick) {
+      var on = pick.getAttribute("data-check") === "all";
+      pick.closest("form").querySelectorAll(".chatpick input").forEach(function(x){ x.checked = on; });
+      return;
+    }
     var b = e.target.closest && e.target.closest("[data-copy]");
     if (!b) return;
     navigator.clipboard.writeText(b.getAttribute("data-copy")).then(
@@ -2023,7 +2054,10 @@ function analysisPanel(env, st, analysis) {
   return `${res}
 <form class="card" method="post" action="/analyze">
 <h2>Анализ переписки</h2>
-<label>Чат<select name="chat">${chatList.map((ch) => `<option value="${esc(ch.chatId)}"${sel(ch.chatId, a.chat)}>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)} · ${ch.count || 0}</option>`).join("")}</select></label>
+<div>
+<div class="pickhead"><span class="meta">Чаты</span><span><button type="button" class="linkbtn" data-check="all">все</button> · <button type="button" class="linkbtn" data-check="none">ни одного</button></span></div>
+<div class="chatpick">${chatList.map((ch, i) => `<label class="pick"><input type="checkbox" name="chat" value="${esc(ch.chatId)}"${checked(a.chats ? a.chats.includes(ch.chatId) : i === 0)}><span>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}</span><small>${ch.count || 0}</small></label>`).join("")}</div>
+</div>
 <div><div class="meta" style="margin-bottom:4px">Период</div><div class="seg">${Object.entries(PERIODS).map(([h, l]) => `<label><input type="radio" name="period" value="${h}"${checked(Number(h) === hours)}><span>${l}</span></label>`).join("")}</div></div>
 <button class="btn primary" name="do" value="stats">📊 Показать статистику</button>
 <h3>Gemini</h3>
@@ -2435,7 +2469,7 @@ export default {
         res = await analyze(env, form);
       } catch (e) {
         res = {
-          a: { chat: String(form.get("chat") || ""), hours: Number(form.get("period")) || 24, question: String(form.get("question") || ""), lang: String(form.get("lang") || "") },
+          a: { chats: form.getAll("chat").map(String), hours: Number(form.get("period")) || 24, question: String(form.get("question") || ""), lang: String(form.get("lang") || "") },
           ok: false,
           html: `<p>${esc(e.message)}</p>`,
         };
