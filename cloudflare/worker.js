@@ -79,6 +79,7 @@ function defaults(env) {
     camera_forward: false,
     camera_chat: "",
     camera_cooldown: 5,
+    cam_clean_enabled: true,
     cal_enabled: false,
     cal_urls: "",
     cal_holidays: "",
@@ -1352,6 +1353,64 @@ async function sendCameraPhoto(env, s, chatId, caption, ev) {
   const res = await fetch(`${c.api}/waInstance${c.id}/sendFileByUpload/${c.token}`, { method: "POST", body: form });
   const raw = await res.text();
   if (!res.ok) throw new Error(`Green API ${res.status}: ${raw.slice(0, 150)}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+// ---------------- Уборка старых тревог камеры ----------------
+// После CAM_CLEAN_HOUR по Баку первая тревога за день ставит в очередь все тревоги, отправленные раньше.
+// Cron удаляет из очереди по CAM_CLEAN_BATCH штук каждые CAM_CLEAN_EVERY мс.
+
+const CAM_CLEAN_HOUR = 5;
+const CAM_CLEAN_BATCH = 3;
+const CAM_CLEAN_EVERY = 3 * 60000;
+
+// Полночь/час по Баку в виде обычного времени (мс UTC).
+const bakuAt = (ms, hour) => {
+  const d = new Date(ms + BAKU_OFFSET_MS);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour) - BAKU_OFFSET_MS;
+};
+
+async function rememberCameraMessage(env, chat, idMessage, time) {
+  if (!idMessage) return;
+  const list = (await env.MQM_KV.get("cam_msgs", "json")) || [];
+  list.push({ id: idMessage, chat, time });
+  await env.MQM_KV.put("cam_msgs", JSON.stringify(list.slice(-300)));
+}
+
+async function startCameraCleanup(env, s, now) {
+  if (!s.cam_clean_enabled || now < bakuAt(now, CAM_CLEAN_HOUR)) return;
+  const day = ymd(new Date(now + BAKU_OFFSET_MS));
+  const state = await env.MQM_KV.get("cam_clean", "json");
+  if (state && state.day === day) return;
+  const cutoff = bakuAt(now, CAM_CLEAN_HOUR);
+  const list = (await env.MQM_KV.get("cam_msgs", "json")) || [];
+  const old = list.filter((m) => m.time < cutoff);
+  const keep = list.filter((m) => m.time >= cutoff);
+  await env.MQM_KV.put("cam_clean", JSON.stringify({ day, queue: old, nextAt: now, deleted: 0 }));
+  await env.MQM_KV.put("cam_msgs", JSON.stringify(keep));
+}
+
+async function runCameraCleanup(env, s, now = Date.now()) {
+  const state = await env.MQM_KV.get("cam_clean", "json");
+  if (!state || !state.queue?.length || now < state.nextAt) return;
+  const c = config(env, s);
+  const batch = state.queue.slice(0, CAM_CLEAN_BATCH);
+  let deleted = state.deleted || 0;
+  for (const m of batch) {
+    try {
+      await apiCall(c, "deleteMessage", { chatId: m.chat, idMessage: m.id, onlySenderDelete: false });
+      deleted++;
+    } catch (e) {
+      // уже удалено — ок; старше 2 суток WhatsApp не даёт удалить — тоже пропускаем, чтобы очередь не застряла
+      if (!String(e.message).includes("already was deleted")) console.log("Тревога не удалена:", e.message);
+    }
+  }
+  await env.MQM_KV.put("cam_clean", JSON.stringify({
+    ...state,
+    queue: state.queue.slice(CAM_CLEAN_BATCH),
+    nextAt: now + CAM_CLEAN_EVERY - 30000, // запас, чтобы минутный cron не пропускал срок
+    deleted,
+  }));
 }
 
 async function cameraEvent(env, ev) {
@@ -1370,10 +1429,10 @@ async function cameraEvent(env, ev) {
     if (s.camera_cooldown && now - (last[camera] || 0) < s.camera_cooldown * 60000) reason = "пауза между тревогами этой камеры";
     else {
       const caption = `🚨 ${camera}${text ? `\n${text}` : ""}\n🕒 ${bakuTime(now)}`;
-      let sentPhoto = false;
+      let sentPhoto = false, photoReply = null;
       if (ev.image) {
         try {
-          await sendCameraPhoto(env, s, s.camera_chat || null, `🕒 ${bakuTime(now)}`, ev);
+          photoReply = await sendCameraPhoto(env, s, s.camera_chat || null, `🕒 ${bakuTime(now)}`, ev);
           sentPhoto = true;
           photo = "sent";
         } catch (e) {
@@ -1382,10 +1441,17 @@ async function cameraEvent(env, ev) {
           console.log("Снимок не отправлен, шлю текстом:", e.message);
         }
       }
-      if (!sentPhoto) await sendTo(env, s, s.camera_chat || null, caption);
+      let sent = null;
+      if (!sentPhoto) sent = await sendTo(env, s, s.camera_chat || null, caption);
+      else sent = photoReply;
       last[camera] = now;
       await env.MQM_KV.put("camera_last", JSON.stringify(last));
       forwarded = true;
+      const chatId = s.camera_chat || config(env, s).chat;
+      if (sent?.idMessage) {
+        await rememberCameraMessage(env, chatId, sent.idMessage, now);
+        await startCameraCleanup(env, s, now);
+      }
     }
   }
   if (firebaseReady(env)) {
@@ -1471,6 +1537,12 @@ function homeHouseCard(env, st) {
     return switchRows(dev, live.v, h.timers, "home");
   }).join("");
   return `<section class="card"><h2>🏠 Дом</h2>${h.tokenError ? `<p class="bad">${esc(h.tokenError)}</p>` : rows}<a class="btn" href="#house">Всё о доме</a></section>`;
+}
+
+function camCleanNote(cc) {
+  if (!cc || !cc.queue?.length) return cc?.day ? `<p class="hint">Уборка за ${cc.day}: удалено ${cc.deleted || 0}, очередь пуста.</p>` : "";
+  const mins = Math.max(0, Math.ceil((cc.nextAt + CAM_CLEAN_EVERY - Date.now()) / 60000));
+  return `<p class="hint">Уборка: удалено ${cc.deleted || 0}, осталось ${cc.queue.length} (по ${CAM_CLEAN_BATCH} раз в ${CAM_CLEAN_EVERY / 60000} мин, следующие примерно через ${mins} мин).</p>`;
 }
 
 function photoNote(e) {
@@ -1576,6 +1648,8 @@ ${ready && !h.devs.length ? "" : `<details><summary>Как это работае
 </form>
 <section class="card">
 <h2>Последние тревоги</h2>
+${toggleForm("cam_clean_enabled", s.cam_clean_enabled, "Удалять старые тревоги из группы после 5 утра")}
+${camCleanNote(st.camClean)}
 ${h.camError ? `<p class="bad">${esc(h.camError)}</p>` : h.camEvents.length
     ? h.camEvents.map((e) => `<div class="row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small><br><small>${photoNote(e)}</small></span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("") + oldScriptHint(h.camEvents)
     : `<p class="meta">Пока не было.${firebaseReady(env) ? "" : " Список хранится в Firebase — он не настроен."}</p>`}
@@ -1974,7 +2048,8 @@ async function gatherStatus(env, origin) {
   const house = await houseStatus(env, s);
   const camToken = await cameraToken(env);
   const cameraUrl = camToken ? `${origin}/camera/${camToken}` : null;
-  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl };
+  const camClean = kv ? await kv.get("cam_clean", "json") : null;
+  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean };
 }
 
 function problems(env, st) {
@@ -2337,6 +2412,7 @@ const TOGGLES = {
   exam_enabled: ["Слежение за баллами включено", "Слежение за баллами выключено"],
   weather_enabled: ["Утренний прогноз включён", "Утренний прогноз выключен"],
   cal_enabled: ["Календарь включён", "Календарь выключен"],
+  cam_clean_enabled: ["Старые тревоги удаляются после 5 утра", "Старые тревоги не удаляются"],
 };
 
 async function toggleSetting(request, env) {
@@ -2415,6 +2491,13 @@ export default {
         await runTimers(env, s);
       } catch (e) {
         console.log("ОШИБКА таймеров:", e.message);
+      }
+    }
+    if (env.MQM_KV) {
+      try {
+        await runCameraCleanup(env, s);
+      } catch (e) {
+        console.log("ОШИБКА уборки тревог:", e.message);
       }
     }
     if (!s.enabled) return;
