@@ -1301,8 +1301,13 @@ async function handleCommand(env, body) {
 
 async function handleCommandInner(env, body) {
   const dir = MESSAGE_WEBHOOKS[body.typeWebhook];
-  if (dir !== "incoming" && dir !== "outgoing") return; // свои ответы бота (outgoing_api) не разбираем
   const text = messageText(body.messageData);
+  if (text && text.trim().startsWith("!") && env.MQM_KV) {
+    // фиксируем каждую команду сразу, чтобы в журнале было видно, дошла ли она до бота
+    const who = phoneDigits(String(body.senderData?.sender || "").replace(/@.*/, "")) || "?";
+    await tuyaLog(env, `📨 команда «${text.trim().slice(0, 40)}» от +${who} (${body.typeWebhook})`, true);
+  }
+  if (dir !== "incoming" && dir !== "outgoing") return; // свои ответы бота (outgoing_api) не разбираем
   if (!text || !text.trim().startsWith("!") || !env.MQM_KV) return;
   const preview = text.trim().slice(0, 40);
   if (!tuyaReady(env)) {
