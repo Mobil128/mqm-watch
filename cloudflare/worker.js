@@ -1413,6 +1413,34 @@ async function runCameraCleanup(env, s, now = Date.now()) {
   }));
 }
 
+// Ручная уборка: все тревоги камер (текст 🚨 и фото с подписью 🕒) старше сегодняшних 05:00 по Баку.
+// Работает по истории чата, поэтому видит и тревоги, отправленные до появления очереди.
+const CAM_PURGE_MAX = 40;
+async function purgeCameraAlerts(env, s) {
+  const c = config(env, s);
+  const chat = s.camera_chat || c.chat;
+  const cutoffSec = bakuAt(Date.now(), CAM_CLEAN_HOUR) / 1000;
+  const history = (await apiCall(c, "getChatHistory", { chatId: chat, count: 300 })) || [];
+  const isAlert = (m) => m.type === "outgoing" && (
+    (typeof m.textMessage === "string" && m.textMessage.startsWith("🚨"))
+    || (m.typeMessage === "imageMessage" && String(m.caption || "").startsWith("🕒")));
+  const old = history.filter((m) => isAlert(m) && (m.timestamp || 0) < cutoffSec)
+    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  const todo = old.slice(0, CAM_PURGE_MAX);
+  let deleted = 0, gone = 0, failed = 0;
+  for (const m of todo) {
+    try {
+      await apiCall(c, "deleteMessage", { chatId: chat, idMessage: m.idMessage, onlySenderDelete: false });
+      deleted++;
+    } catch (e) {
+      if (String(e.message).includes("already was deleted")) gone++;
+      else { failed++; c.log(`не удалось: ${e.message.slice(0, 120)}`); }
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return { found: old.length, deleted, gone, failed, left: old.length - todo.length };
+}
+
 async function cameraEvent(env, ev) {
   const s = await loadSettings(env);
   const now = Date.now();
@@ -2327,6 +2355,7 @@ ${actionButton("service", "webhook", "🔗 Подключить вебхук в 
 <h2>Действия</h2>
 <div class="btns">
 ${actionButton("service", "orders", "⛽ Найти заказы в собранных сообщениях")}
+${actionButton("service", "cam_purge", "🧹 Удалить старые тревоги камер (фото и текст)", { cls: "danger", confirmText: "Удалить из группы все тревоги камер, отправленные до сегодняшних 05:00? Удалить можно только то, что WhatsApp ещё разрешает." })}
 ${actionButton("service", "dump", "🔍 Что бот видит на странице экзамена")}
 ${actionButton("service", "clean", "🧹 Удалить старые сообщения бота", { cls: "danger", confirmText: "Удалить у всех старые сообщения бота в группе?" })}
 ${actionButton("service", "reset", "↺ Сбросить сохранённые баллы", { cls: "danger", confirmText: "Сбросить сохранённые баллы? Следующая проверка запомнит текущие без сообщения." })}
@@ -2447,6 +2476,19 @@ async function doAction(env, action, origin) {
   if (action === "webhook") {
     try {
       return { ok: true, summary: "адрес прописан, Green API может пару минут перезапускаться", log: await connectWebhook(env, origin) };
+    } catch (e) {
+      return { ok: false, summary: e.message };
+    }
+  }
+  if (action === "cam_purge") {
+    try {
+      const r = await purgeCameraAlerts(env, s);
+      if (!r.found) return { ok: true, summary: "старых тревог камер в истории чата не нашлось" };
+      const parts = [`удалено ${r.deleted}`];
+      if (r.gone) parts.push(`уже не было: ${r.gone}`);
+      if (r.failed) parts.push(`WhatsApp не дал удалить: ${r.failed}`);
+      if (r.left) parts.push(`осталось ${r.left} — нажмите ещё раз`);
+      return { ok: true, summary: parts.join(", "), log: r.failed ? "Часть тревог старше нескольких суток: WhatsApp не удаляет такие сообщения." : undefined, open: r.failed > 0 };
     } catch (e) {
       return { ok: false, summary: e.message };
     }
