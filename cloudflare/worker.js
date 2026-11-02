@@ -1289,13 +1289,31 @@ async function runCommand(env, s, text) {
   return `${t.label}: ${cmd.value ? "açıldı ✅" : "bağlandı ⏹"}`;
 }
 
+// Любая команда («!…»), которую бот получил, но не выполнил, оставляет в журнале дома причину.
 async function handleCommand(env, body) {
+  try {
+    await handleCommandInner(env, body);
+  } catch (e) {
+    console.log("ОШИБКА команды:", e.message);
+    await tuyaLog(env, `⚠️ Команда не обработана: ${e.message}`, false).catch(() => {});
+  }
+}
+
+async function handleCommandInner(env, body) {
   const dir = MESSAGE_WEBHOOKS[body.typeWebhook];
   if (dir !== "incoming" && dir !== "outgoing") return; // свои ответы бота (outgoing_api) не разбираем
   const text = messageText(body.messageData);
-  if (!text || !text.trim().startsWith("!") || !env.MQM_KV || !tuyaReady(env)) return;
+  if (!text || !text.trim().startsWith("!") || !env.MQM_KV) return;
+  const preview = text.trim().slice(0, 40);
+  if (!tuyaReady(env)) {
+    await tuyaLog(env, `⏸ Команда «${preview}» получена, но секретов Tuya нет`, false);
+    return;
+  }
   const s = await loadSettings(env);
-  if (!s.tuya_wa) return;
+  if (!s.tuya_wa) {
+    await tuyaLog(env, `⏸ Команда «${preview}» получена, но «Управлять реле сообщениями» выключено (включите и нажмите «Сохранить»)`, false);
+    return;
+  }
   const sd = body.senderData || {};
   const allowed = new Set(String(s.tuya_wa_numbers || "").split(/[,;\n]+/).map(phoneDigits).filter(Boolean));
   const from = phoneDigits(String(sd.sender || "").replace(/@.*/, ""));
