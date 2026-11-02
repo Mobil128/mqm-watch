@@ -1298,7 +1298,11 @@ async function handleCommand(env, body) {
   if (!s.tuya_wa) return;
   const sd = body.senderData || {};
   const allowed = new Set(String(s.tuya_wa_numbers || "").split(/[,;\n]+/).map(phoneDigits).filter(Boolean));
-  if (dir === "incoming" && !allowed.has(phoneDigits(String(sd.sender || "").replace(/@.*/, "")))) return;
+  const from = phoneDigits(String(sd.sender || "").replace(/@.*/, ""));
+  if (dir === "incoming" && !allowed.has(from)) {
+    await tuyaLog(env, `🚫 Команда от +${from || "?"} не принята: номера нет в «Кому можно» (${text.trim().slice(0, 40)})`, false);
+    return;
+  }
   const key = `cmd_${fbKey(body.idMessage)}`; // Green API может прислать то же уведомление повторно
   if (await env.MQM_KV.get(key)) return;
   await env.MQM_KV.put(key, "1", { expirationTtl: 86400 });
