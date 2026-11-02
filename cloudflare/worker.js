@@ -831,7 +831,7 @@ async function noteWebhook(env, ok, note, weak = false) {
 
 // Последнее уведомление Green API как пришло — для диагностики команд (без значений секретов).
 async function noteRawHook(env, body) {
-  if (!env.MQM_KV) return;
+  if (!env.MQM_KV || !MESSAGE_WEBHOOKS[body.typeWebhook]) return; // статусы доставки не перекрывают сообщения
   const md = body.messageData || {};
   const text = messageText(md);
   await env.MQM_KV.put("last_hook_raw", JSON.stringify({
@@ -2381,7 +2381,7 @@ function servicePanel(env, st, origin, result) {
     ["Секреты", secretsReport(env)],
     ["WhatsApp", gState.v ? (gState.v.stateInstance === "authorized" ? `<span class="ok">подключён</span>` : `<span class="bad">${esc(gState.v.stateInstance)}</span>`) : `<span class="bad">нет ответа</span>`],
     ["Вебхук в Green API", hookWhere === "ours" ? `<span class="ok">настроен</span>` : hookWhere === "other" ? `<span class="bad">другой адрес</span>` : hookWhere === "none" ? `<span class="bad">не задан</span>` : "—"],
-    ["Последнее уведомление", st.rawHook ? `${ago(st.rawHook.time)} · ${esc(st.rawHook.type)}<br><small>от +${esc(st.rawHook.from)} · тип ${esc(st.rawHook.msgType)}<br>текст: ${st.rawHook.text == null ? "— нет" : `«${esc(st.rawHook.text)}»`}</small>` : "ещё не приходило"],
+    ["Последнее сообщение из чатов", st.rawHook ? `${ago(st.rawHook.time)} · ${esc(st.rawHook.type)}<br><small>от +${esc(st.rawHook.from)} · тип ${esc(st.rawHook.msgType)}<br>текст: ${st.rawHook.text == null ? "— нет" : `«${esc(st.rawHook.text)}»`}</small>` : "ещё не приходило"],
     ["Последнее сообщение", lastHook ? `${ago(lastHook.time)} · ${lastHook.ok ? `<span class="ok">сохранено</span>` : `<span class="bad">ошибка</span><br><small>${esc(lastHook.note)}</small>`}` : "ещё не приходило"],
     ["Firebase", !firebaseReady(env) ? `<span class="bad">не настроен</span>` : chats.e ? `<span class="bad">ошибка</span>` : `<span class="ok">работает</span> · ${env.FIREBASE_SECRET ? "секрет базы" : "сервисный аккаунт"}`],
   ];
