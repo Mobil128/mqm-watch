@@ -829,6 +829,21 @@ async function noteWebhook(env, ok, note, weak = false) {
   await env.MQM_KV.put("last_webhook", JSON.stringify({ time: Date.now(), ok, note: String(note).slice(0, 300) }));
 }
 
+// Последнее уведомление Green API как пришло — для диагностики команд (без значений секретов).
+async function noteRawHook(env, body) {
+  if (!env.MQM_KV) return;
+  const md = body.messageData || {};
+  const text = messageText(md);
+  await env.MQM_KV.put("last_hook_raw", JSON.stringify({
+    time: Date.now(),
+    type: body.typeWebhook || "?",
+    from: phoneDigits(String(body.senderData?.sender || "").replace(/@.*/, "")) || "?",
+    chat: String(body.senderData?.chatId || "").slice(0, 25),
+    msgType: md.typeMessage || "?",
+    text: text == null ? null : String(text).slice(0, 60),
+  }));
+}
+
 function ago(ms) {
   const min = Math.round((Date.now() - ms) / 60000);
   if (min < 1) return "только что";
@@ -2104,7 +2119,8 @@ async function gatherStatus(env, origin) {
   const camToken = await cameraToken(env);
   const cameraUrl = camToken ? `${origin}/camera/${camToken}` : null;
   const camClean = kv ? await kv.get("cam_clean", "json") : null;
-  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean };
+  const rawHook = kv ? await kv.get("last_hook_raw", "json") : null;
+  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook };
 }
 
 function problems(env, st) {
@@ -2365,6 +2381,7 @@ function servicePanel(env, st, origin, result) {
     ["Секреты", secretsReport(env)],
     ["WhatsApp", gState.v ? (gState.v.stateInstance === "authorized" ? `<span class="ok">подключён</span>` : `<span class="bad">${esc(gState.v.stateInstance)}</span>`) : `<span class="bad">нет ответа</span>`],
     ["Вебхук в Green API", hookWhere === "ours" ? `<span class="ok">настроен</span>` : hookWhere === "other" ? `<span class="bad">другой адрес</span>` : hookWhere === "none" ? `<span class="bad">не задан</span>` : "—"],
+    ["Последнее уведомление", st.rawHook ? `${ago(st.rawHook.time)} · ${esc(st.rawHook.type)}<br><small>от +${esc(st.rawHook.from)} · тип ${esc(st.rawHook.msgType)}<br>текст: ${st.rawHook.text == null ? "— нет" : `«${esc(st.rawHook.text)}»`}</small>` : "ещё не приходило"],
     ["Последнее сообщение", lastHook ? `${ago(lastHook.time)} · ${lastHook.ok ? `<span class="ok">сохранено</span>` : `<span class="bad">ошибка</span><br><small>${esc(lastHook.note)}</small>`}` : "ещё не приходило"],
     ["Firebase", !firebaseReady(env) ? `<span class="bad">не настроен</span>` : chats.e ? `<span class="bad">ошибка</span>` : `<span class="ok">работает</span> · ${env.FIREBASE_SECRET ? "секрет базы" : "сервисный аккаунт"}`],
   ];
@@ -2636,6 +2653,7 @@ export default {
         return new Response("Bad JSON", { status: 400 });
       }
       ctx.waitUntil(handleCommand(env, body).catch((e) => console.log("ОШИБКА команды:", e.message)));
+      ctx.waitUntil(noteRawHook(env, body));
       try {
         await storeWebhook(env, body);
       } catch (e) {
