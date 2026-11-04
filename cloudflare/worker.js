@@ -1317,6 +1317,14 @@ async function handleCommand(env, body) {
 async function handleCommandInner(env, body) {
   const dir = MESSAGE_WEBHOOKS[body.typeWebhook];
   const text = messageText(body.messageData);
+  let mainChat = (env.GREEN_CHAT_ID || "").trim();
+  if (mainChat && !mainChat.includes("@")) mainChat += "@g.us";
+  const fromChat = body.senderData?.chatId || "";
+  if (mainChat && fromChat && fromChat !== mainChat) {
+    // команды и ответы — только в основной группе
+    if (text && text.trim().startsWith("!") && env.MQM_KV) await tuyaLog(env, `⛔ команда «${text.trim().slice(0, 40)}» из другого чата — не выполнена`, false);
+    return;
+  }
   if (text && text.trim().startsWith("!") && env.MQM_KV) {
     // фиксируем каждую команду сразу, чтобы в журнале было видно, дошла ли она до бота
     const who = phoneDigits(String(body.senderData?.sender || "").replace(/@.*/, "")) || "?";
@@ -1352,7 +1360,7 @@ async function handleCommandInner(env, body) {
     reply = `Xəta: ${e.message}`;
   }
   await tuyaLog(env, `💬 ${sd.senderName || phoneDigits(sd.sender)}: ${text.trim()} → ${reply.split("\n")[0]}`, ok);
-  if (s.tuya_wa_reply) await sendTo(env, s, sd.chatId, `🔌 ${reply}`);
+  if (s.tuya_wa_reply) await sendTo(env, s, fromChat || mainChat, `🔌 ${reply}`);
 }
 
 // ---------------- Дом: тревоги камер ----------------
