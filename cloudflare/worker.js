@@ -32,7 +32,7 @@ const COUNTERS = {
 
 // Уборка трогает только свои исходящие сообщения с этими значками.
 const SCORE_PREFIX = "📊";
-const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test", "🔌", "📅"];
+const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test", "🔌", "📅", "📚"];
 // Бесплатный план Cloudflare: не больше 50 внешних запросов за запуск.
 const MAX_DELETES = 40;
 // Бесплатный план KV: 1000 записей в сутки; каждая проверка пишет лог запуска.
@@ -85,6 +85,9 @@ function defaults(env) {
     cal_holidays: "",
     cal_hour: 8,
     cal_tomorrow: true,
+    sched_enabled: false,
+    sched_before: 0,
+    sched_chat: "",
   };
 }
 
@@ -575,6 +578,242 @@ async function dailyCalendar(c, force) {
     if (!force) await c.kv.put("cal_retry_at", String(Date.now() + 30 * 60000), { expirationTtl: 7200 });
     throw e;
   }
+}
+
+// ---------------- Расписание уроков ----------------
+// Уроки лежат в Firebase (/schedule/lessons/<id>), копия — в KV ("lessons_cache"), чтобы минутный cron не ходил в базу.
+// В начале урока (или за N минут) бот пишет в группу; сообщения об уроках за прошлые дни удаляются.
+
+const LESSON_DAYS = [[1, "Понедельник"], [2, "Вторник"], [3, "Среда"], [4, "Четверг"], [5, "Пятница"], [6, "Суббота"], [0, "Воскресенье"]];
+const LESSON_BEFORE = [0, 5, 10, 15, 30];
+const LESSON_DURATIONS = [30, 40, 45, 50, 60, 75, 90, 120];
+const LESSON_WINDOW_MIN = 5; // сколько минут после срока ещё можно отправить (если cron пропустил минуту)
+const LESSON_CLEAN_BATCH = 5;
+
+// Расписание из приложения расписания (shared.data): день 1 — понедельник … 6 — суббота, 0 — воскресенье.
+const LESSON_SEED = [
+  ["l1", 1, "08:00", "Cəbr (Riyaziyyat)"], ["l2", 1, "13:30", "İngilis dili"], ["l14", 1, "19:00", "Əlavə İnglis(online)"],
+  ["l3", 2, "09:00", "Fizika"], ["l4", 2, "17:00", "Azərbaycan dili"],
+  ["l5", 3, "08:00", "Riyaziyyat"], ["l6", 3, "16:00", "İnformatika"], ["l15", 3, "19:00", "Əlavə İnglis(online)"],
+  ["l7", 4, "08:00", "Riyaziyyat"], ["l8", 4, "10:30", "Fizika"], ["l9", 4, "13:30", "İngilis dili"], ["l10", 4, "17:00", "Azərbaycan dili"],
+  ["l16", 5, "19:00", "Əlavə İnglis(online)"],
+  ["l11", 6, "09:00", "İnformatika"], ["l12", 6, "14:30", "Fizika"], ["l13", 6, "17:00", "Azərbaycan dili"],
+].map(([id, day, time, subject]) => ({ id, day, time, duration: 60, subject }));
+
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const toMin = (t) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3));
+const lessonEnd = (l) => {
+  const e = toMin(l.time) + l.duration;
+  return `${pad(Math.floor(e / 60) % 24)}:${pad(e % 60)}`;
+};
+
+function lessonList(obj) {
+  return Object.entries(obj || {})
+    .map(([id, r]) => ({ id, day: Number(r?.day), time: String(r?.time || ""), duration: Number(r?.duration) || 60, subject: String(r?.subject || "") }))
+    .filter((l) => Number.isInteger(l.day) && l.day >= 0 && l.day <= 6 && TIME_RE.test(l.time) && l.subject)
+    .sort((a, b) => a.time.localeCompare(b.time));
+}
+
+const lessonsCacheGet = async (env) => (await env.MQM_KV.get("lessons_cache", "json")) || [];
+
+async function lessonsRefreshCache(env) {
+  const list = lessonList(await firebase(env, "GET", "/schedule/lessons"));
+  await env.MQM_KV.put("lessons_cache", JSON.stringify(list));
+  return list;
+}
+
+const lessonMessage = (l, before) =>
+  `${before ? `📚 ${before} dəq sonra dərs: ${l.subject}` : `📚 Dərs başlayır: ${l.subject}`}\n🕒 ${l.time}–${lessonEnd(l)}`;
+
+async function rememberLessonMessage(env, chat, idMessage, time) {
+  if (!idMessage) return;
+  const list = (await env.MQM_KV.get("lesson_msgs", "json")) || [];
+  list.push({ id: idMessage, chat, time });
+  await env.MQM_KV.put("lesson_msgs", JSON.stringify(list.slice(-100)));
+}
+
+// Удаляет сообщения об уроках, отправленные до сегодняшней полуночи (по Баку), по нескольку за минуту.
+async function cleanLessonMessages(env, s, now) {
+  const list = (await env.MQM_KV.get("lesson_msgs", "json")) || [];
+  const cutoff = bakuAt(now, 0);
+  const batch = list.filter((m) => m.time < cutoff).slice(0, LESSON_CLEAN_BATCH);
+  if (!batch.length) return;
+  const c = config(env, s);
+  for (const m of batch) {
+    try {
+      await apiCall(c, "deleteMessage", { chatId: m.chat, idMessage: m.id, onlySenderDelete: false });
+    } catch (e) {
+      if (!String(e.message).includes("already was deleted")) console.log("Сообщение об уроке не удалено:", e.message);
+    }
+  }
+  const done = new Set(batch.map((m) => m.id)); // что не удалилось (слишком старое) — тоже убираем из очереди
+  await env.MQM_KV.put("lesson_msgs", JSON.stringify(list.filter((m) => !done.has(m.id))));
+}
+
+async function runLessons(env, s, now = Date.now()) {
+  await cleanLessonMessages(env, s, now);
+  if (!s.sched_enabled) return;
+  const d = new Date(now + BAKU_OFFSET_MS);
+  const day = d.getUTCDay();
+  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  const today = ymd(d);
+  const before = s.sched_before || 0;
+  for (const l of await lessonsCacheGet(env)) {
+    if (l.day !== day) continue;
+    const target = toMin(l.time) - before;
+    if (mins < target || mins >= target + LESSON_WINDOW_MIN) continue;
+    const key = `lesson_${today}_${fbKey(l.id)}`;
+    if (await env.MQM_KV.get(key)) continue;
+    try {
+      const reply = await sendTo(env, s, s.sched_chat || null, lessonMessage(l, before));
+      await env.MQM_KV.put(key, "1", { expirationTtl: 172800 });
+      await rememberLessonMessage(env, s.sched_chat || config(env, s).chat, reply?.idMessage, now);
+      await env.MQM_KV.put("lesson_last", JSON.stringify({ time: now, ok: true, text: `${l.time} ${l.subject}` }));
+    } catch (e) {
+      await env.MQM_KV.put("lesson_last", JSON.stringify({ time: now, ok: false, text: `${l.time} ${l.subject}: ${e.message.slice(0, 120)}` }));
+    }
+  }
+}
+
+function lessonFields(time, subject, duration) {
+  if (!TIME_RE.test(time)) throw new Error("Время урока — в формате 08:30");
+  if (!subject || subject.length > 60) throw new Error("Название урока: от 1 до 60 символов");
+  const dur = Number(duration);
+  if (!Number.isInteger(dur) || dur < 5 || dur > 300) throw new Error("Длительность урока: от 5 до 300 минут");
+  return { time, subject, duration: dur };
+}
+
+async function lessonsAction(env, form) {
+  if (!firebaseReady(env)) throw new Error("Расписание хранится в Firebase — он не настроен");
+  const str = (k) => String(form.get(k) ?? "").trim();
+  const action = str("do");
+
+  if (action === "seed") {
+    const obj = Object.fromEntries(LESSON_SEED.map((l) => [l.id, { day: l.day, time: l.time, duration: l.duration, subject: l.subject }]));
+    await firebase(env, "PUT", "/schedule/lessons", obj);
+    return `Расписание загружено: ${(await lessonsRefreshCache(env)).length} уроков`;
+  }
+
+  if (action === "day_save") {
+    const day = Number(str("day"));
+    if (!Number.isInteger(day) || day < 0 || day > 6) throw new Error("Неверный день недели");
+    const current = lessonList(await firebase(env, "GET", "/schedule/lessons")).filter((l) => l.day === day);
+    const updates = {};
+    let removed = 0, changed = 0, added = 0;
+    for (const l of current) {
+      if (form.get(`x_${l.id}`) === "on") { updates[l.id] = null; removed++; continue; }
+      if (!form.has(`t_${l.id}`)) continue;
+      const rec = lessonFields(str(`t_${l.id}`), str(`s_${l.id}`), str(`d_${l.id}`));
+      if (rec.time !== l.time || rec.subject !== l.subject || rec.duration !== l.duration) { updates[l.id] = { day, ...rec }; changed++; }
+    }
+    if (str("new_time") || str("new_subject")) {
+      const id = `l${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+      updates[id] = { day, ...lessonFields(str("new_time"), str("new_subject"), str("new_dur") || "60") };
+      added++;
+    }
+    if (!Object.keys(updates).length) return "Изменений нет";
+    await firebase(env, "PATCH", "/schedule/lessons", updates);
+    await lessonsRefreshCache(env);
+    return `Сохранено: изменено ${changed}, добавлено ${added}, удалено ${removed}`;
+  }
+
+  if (action === "settings_save") {
+    const before = Number(str("sched_before"));
+    if (!LESSON_BEFORE.includes(before)) throw new Error("Неверное время предупреждения");
+    const chat = str("sched_chat");
+    if (chat && !/^[\w.-]+@(g|c)\.us$/.test(chat)) throw new Error("Неверный чат");
+    await env.MQM_KV.put("settings", JSON.stringify({ ...(await loadSettings(env)), sched_before: before, sched_chat: chat }));
+    return "Настройки уроков сохранены";
+  }
+  throw new Error("Неизвестное действие");
+}
+
+// ---------------- Расписание уроков: страница ----------------
+
+function nextLessonText(list, now = Date.now()) {
+  const d = new Date(now + BAKU_OFFSET_MS);
+  const day = d.getUTCDay();
+  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  for (let i = 0; i < 7; i++) {
+    const dd = (day + i) % 7;
+    const l = list.filter((x) => x.day === dd && (i > 0 || toMin(x.time) > mins)).sort((a, b) => a.time.localeCompare(b.time))[0];
+    if (l) return `${i === 0 ? "сегодня" : i === 1 ? "завтра" : LESSON_DAYS.find(([n]) => n === dd)[1].toLowerCase()} ${l.time} — ${l.subject}`;
+  }
+  return null;
+}
+
+function lessonsCard(st) {
+  const { s, lessons } = st;
+  const day = bakuNow().getUTCDay();
+  const today = lessons.filter((l) => l.day === day);
+  const next = nextLessonText(lessons);
+  return `<section class="card">
+<h2>📚 Уроки</h2>
+${toggleForm("sched_enabled", s.sched_enabled, "Сообщение в группу, когда начинается урок", "lessons")}
+${lessons.length
+    ? `<p class="meta">Сегодня: ${today.length ? today.map((l) => `${l.time} ${esc(l.subject)}`).join(" · ") : "уроков нет"}</p>
+${next ? `<p class="meta">Ближайший: ${esc(next)}</p>` : ""}`
+    : `<p class="meta">Расписания ещё нет — загрузите его на вкладке «Уроки».</p>`}
+<a class="btn" href="#lessons">📚 Расписание</a>
+</section>`;
+}
+
+function lessonsPanel(env, st, openDay = null) {
+  const { s, lessons, lessonsErr, lessonLast } = st;
+  const durOptions = (cur) => [...new Set([...LESSON_DURATIONS, cur])].sort((a, b) => a - b).map((m) => `<option value="${m}"${sel(m, cur)}>${m} мин</option>`).join("");
+  const chats = st.chatList.map((ch) => `<option value="${esc(ch.chatId)}"${sel(ch.chatId, s.sched_chat)}>${ch.isGroup ? "👥" : "👤"} ${esc(ch.name || ch.chatId)}</option>`).join("");
+  const sample = lessons[0] || { time: "13:30", duration: 60, subject: "İngilis dili" };
+
+  const head = `${subnav("lessons")}
+<section class="card">
+<h2>📚 Уроки</h2>
+${toggleForm("sched_enabled", s.sched_enabled, "Сообщение в группу, когда начинается урок", "lessons")}
+<form method="post" action="/lessons" class="adv">
+<input type="hidden" name="do" value="settings_save">
+<div class="grid2">
+<label>Когда писать<select name="sched_before">${LESSON_BEFORE.map((m) => `<option value="${m}"${sel(m, s.sched_before)}>${m ? `за ${m} мин` : "в начале"}</option>`).join("")}</select></label>
+<label>Куда<select name="sched_chat"><option value=""${sel("", s.sched_chat)}>Основная группа</option>${chats}</select></label>
+</div>
+<button class="btn">💾 Сохранить</button>
+</form>
+<p class="hint">Так выглядит сообщение:<br><code>${esc(lessonMessage(sample, s.sched_before || 0)).replace(/\n/g, "<br>")}</code></p>
+<p class="hint">Сообщения об уроках за прошлые дни бот удаляет сам после полуночи по Баку. ${lessonLast ? `Последнее сообщение: ${ago(lessonLast.time)} · ${lessonLast.ok ? `<span class="ok">отправлено</span>` : `<span class="bad">ошибка</span>`} (${esc(lessonLast.text)})` : ""}</p>
+${lessonsErr ? `<p class="bad">Firebase: ${esc(lessonsErr)} — показана копия расписания.</p>` : ""}
+</section>`;
+
+  if (!firebaseReady(env)) return head + `<section class="card"><p class="meta">Расписание хранится в Firebase — он не настроен (см. «Сервис»).</p></section>`;
+
+  const openNum = openDay != null && openDay !== "" && Number.isInteger(Number(openDay)) ? Number(openDay) : bakuNow().getUTCDay();
+  const days = LESSON_DAYS.map(([n, name]) => {
+    const items = lessons.filter((l) => l.day === n);
+    const rows = items.map((l) => `<div class="lrow">
+<div class="l1"><input type="time" name="t_${esc(l.id)}" value="${l.time}" required aria-label="Начало урока"><input type="text" name="s_${esc(l.id)}" value="${esc(l.subject)}" maxlength="60" required aria-label="Предмет"></div>
+<div class="l2"><select name="d_${esc(l.id)}" aria-label="Длительность">${durOptions(l.duration)}</select><label class="del"><input type="checkbox" name="x_${esc(l.id)}"> Удалить</label></div>
+</div>`).join("");
+    return `<details class="card day"${n === openNum ? " open" : ""}>
+<summary><b>${name}</b> <span class="meta">${items.length ? `${items.length} ур. · ${items.map((l) => l.time).join(" ")}` : "нет уроков"}</span></summary>
+<form method="post" action="/lessons" class="adv">
+<input type="hidden" name="do" value="day_save"><input type="hidden" name="day" value="${n}">
+${rows}
+<div class="lrow add"><div class="meta">＋ Добавить урок</div>
+<div class="l1"><input type="time" name="new_time" aria-label="Начало нового урока"><input type="text" name="new_subject" maxlength="60" placeholder="Предмет, например Fizika" aria-label="Предмет нового урока"></div>
+<div class="l2"><select name="new_dur" aria-label="Длительность">${durOptions(60)}</select></div></div>
+<button class="btn">💾 Сохранить день</button>
+</form>
+</details>`;
+  }).join("");
+
+  const seed = `<section class="card">
+<h2>Загрузить расписание</h2>
+<p class="meta">Расписание из вашего приложения: понедельник — суббота, 16 уроков, воскресенье свободно. ${lessons.length ? "Загрузка заменит всё, что есть сейчас." : ""}</p>
+${actionButtonPost("/lessons", "seed", "⬇️ Загрузить расписание из файла", lessons.length ? "Заменить текущее расписание на расписание из файла?" : "")}
+</section>`;
+
+  return head + (lessons.length ? days + seed : seed + days);
+}
+
+function actionButtonPost(action, value, label, confirmText = "") {
+  return `<form method="post" action="${action}"><button class="btn" name="do" value="${value}"${confirmText ? ` data-confirm="${esc(confirmText)}"` : ""}>${label}</button></form>`;
 }
 
 // ---------------- Запуск ----------------
@@ -1884,7 +2123,7 @@ async function isAuthed(request, env) {
   return !!m && m[1] === (await authToken(env));
 }
 
-const TABS = ["home", "orders", "house", "analysis", "settings", "service"];
+const TABS = ["home", "orders", "house", "analysis", "settings", "service", "lessons"];
 const NAV = ["home", "orders", "house", "analysis", "settings"]; // «Сервис» — внутри «Настроек»
 const INTERVALS = [5, 10, 15, 20, 30, 60, 120, 180, 360, 720, 1440];
 const intervalLabel = (m) => (m < 60 ? `каждые ${m} мин` : m === 60 ? "каждый час" : m === 1440 ? "раз в сутки" : `каждые ${m / 60} ч`);
@@ -1963,7 +2202,7 @@ h3{font-size:14px;margin:6px 0 0;color:var(--mut);font-weight:600}
 .blabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .brow.wide{grid-template-columns:5ch 1fr 8ch}
 a{color:var(--acc)}
-input[type=date]{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px;min-height:46px}
+input[type=date],input[type=time]{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px;min-height:46px}
 .datebar{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
 .btrack{height:10px}
 .bfill{display:block;height:100%;background:var(--acc);border-radius:0 4px 4px 0}
@@ -1983,9 +2222,19 @@ input[type=date]{width:100%;padding:10px 12px;border:1px solid var(--line);borde
 .btn.small{width:auto;padding:6px 12px;font-size:14px;font-weight:500;border-radius:999px}
 .steps{margin:0;padding-left:20px;display:grid;gap:6px;font-size:14px}
 .cmds{margin:0;padding-left:18px;display:grid;gap:4px;font-size:14px}
-.subnav{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px}
+.subnav{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px}
 .subnav a{text-align:center;padding:8px;border-radius:9px;text-decoration:none;color:var(--fg);font-size:15px}
 .subnav a[aria-current=page]{background:var(--acc-soft);color:var(--acc);font-weight:600}
+.lrow{display:grid;gap:6px;padding:8px 0;border-top:1px solid var(--line)}
+.lrow:first-of-type{border-top:0;padding-top:0}
+.l1{display:grid;grid-template-columns:104px 1fr;gap:8px}
+.l2{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.l2 select{width:auto;padding:8px 10px;font-size:14px}
+details.day>summary{display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding:2px 0;color:var(--fg);font-size:16px}
+details.day>summary .meta{font-size:13px}
+details.day[open]>summary{margin-bottom:6px}
+label.del{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--bad)}
+label.del input{width:18px;height:18px;accent-color:var(--bad)}
 .pickhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
 .linkbtn{background:none;border:0;padding:0;color:var(--acc);font:inherit;font-size:14px;cursor:pointer}
 .chatpick{max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
@@ -2000,12 +2249,12 @@ input[type=date]{width:100%;padding:10px 12px;border:1px solid var(--line);borde
 // Вкладки, подтверждения и «Подождите…» на кнопках. Без JS все вкладки видны подряд.
 const CLIENT_JS = `
 (function(){
-  var tabs = ["home","orders","house","analysis","settings","service"];
+  var tabs = ["home","orders","house","analysis","settings","service","lessons"];
   var start = document.body.getAttribute("data-tab") || "home";
   function show(t){
     if (tabs.indexOf(t) < 0) t = start;
     tabs.forEach(function(x){ var p = document.getElementById("p-" + x); if (p) p.hidden = x !== t; });
-    var navTab = t === "service" ? "settings" : t;
+    var navTab = (t === "service" || t === "lessons") ? "settings" : t;
     document.querySelectorAll(".nav a").forEach(function(a){ a.setAttribute("aria-current", a.getAttribute("data-tab") === navTab ? "page" : "false"); });
     window.scrollTo(0, 0);
   }
@@ -2054,7 +2303,7 @@ const ICONS = {
   service: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   orders: '<path d="M4 21V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v16M3 21h12M7 8h4M14 9h2a2 2 0 0 1 2 2v5a1.5 1.5 0 0 0 3 0V8l-3-3"/>',
 };
-const TAB_NAMES = { home: "Главная", orders: "Заказы", house: "Дом", analysis: "Анализ", settings: "Настройки", service: "Сервис" };
+const TAB_NAMES = { home: "Главная", orders: "Заказы", house: "Дом", analysis: "Анализ", settings: "Настройки", service: "Сервис", lessons: "Уроки" };
 
 function page(title, body, { tab = "home", status = 200, nav = true } = {}) {
   const navHtml = nav
@@ -2082,8 +2331,8 @@ ${error ? `<div class="alert">${esc(error)}</div>` : ""}
 const checked = (v) => (v ? " checked" : "");
 const sel = (a, b) => (String(a) === String(b) ? " selected" : "");
 
-function toggleForm(key, on, label) {
-  return `<form method="post" action="/toggle"><input type="hidden" name="key" value="${key}"><input type="hidden" name="v" value="off">`
+function toggleForm(key, on, label, tab = "home") {
+  return `<form method="post" action="/toggle"><input type="hidden" name="key" value="${key}"><input type="hidden" name="tab" value="${tab}"><input type="hidden" name="v" value="off">`
     + `<label class="switch">${label}<input type="checkbox" name="v" value="on"${checked(on)} onchange="this.form.requestSubmit()" aria-label="${esc(label)}"></label></form>`;
 }
 
@@ -2104,7 +2353,7 @@ async function gatherStatus(env, origin) {
   const kv = env.MQM_KV;
   const c = config(env, s);
   const safe = (p) => p.then((v) => ({ v }), (e) => ({ e: e.message }));
-  const [last, state, weatherDate, calDate, lastHook, chats, gState, gSettings, orders] = await Promise.all([
+  const [last, state, weatherDate, calDate, lastHook, chats, gState, gSettings, orders, lessonsRaw] = await Promise.all([
     kv ? kv.get("last_run", "json") : null,
     kv ? kv.get("state", "json") : null,
     kv ? kv.get("weather_date") : null,
@@ -2114,6 +2363,7 @@ async function gatherStatus(env, origin) {
     safe(apiCall(c, "getStateInstance")),
     safe(apiCall(c, "getSettings")),
     firebaseReady(env) ? safe(firebase(env, "GET", "/orders")) : { e: null },
+    firebaseReady(env) ? safe(firebase(env, "GET", "/schedule/lessons")) : { e: null },
   ]);
   const orderList = orders.v ? Object.values(orders.v || {}).filter((o) => o && o.night).sort((a, b) => b.timestamp - a.timestamp) : [];
   const chatList = chats.v ? Object.values(chats.v || {}).sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0)) : [];
@@ -2128,7 +2378,16 @@ async function gatherStatus(env, origin) {
   const cameraUrl = camToken ? `${origin}/camera/${camToken}` : null;
   const camClean = kv ? await kv.get("cam_clean", "json") : null;
   const rawHook = kv ? await kv.get("last_hook_raw", "json") : null;
-  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook };
+  // расписание: основное — Firebase; KV-копию подтягиваем под него, при сбое базы показываем копию
+  let lessons = [];
+  if (lessonsRaw.v !== undefined) {
+    lessons = lessonList(lessonsRaw.v);
+    if (kv && JSON.stringify(lessons) !== JSON.stringify(await lessonsCacheGet(env))) await kv.put("lessons_cache", JSON.stringify(lessons));
+  } else if (kv) {
+    lessons = await lessonsCacheGet(env);
+  }
+  const lessonLast = kv ? await kv.get("lesson_last", "json") : null;
+  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook, lessons, lessonsErr: lessonsRaw.e || null, lessonLast };
 }
 
 function problems(env, st) {
@@ -2187,6 +2446,8 @@ ${actionButton("home", "weather", "🌦 Прислать прогноз сейч
 </section>
 
 ${calendarCard(st)}
+
+${lessonsCard(st)}
 
 ${ordersCard(st)}
 
@@ -2315,7 +2576,7 @@ ${env.GEMINI_API_KEY ? "" : `<p class="hint bad">Для «Разбора» и «
 </form>`;
 }
 
-const subnav = (cur) => `<nav class="subnav" aria-label="Настройки и сервис"><a href="#settings"${cur === "settings" ? ' aria-current="page"' : ""}>⚙️ Настройки</a><a href="#service"${cur === "service" ? ' aria-current="page"' : ""}>🩺 Сервис</a></nav>`;
+const subnav = (cur) => `<nav class="subnav" aria-label="Настройки, уроки и сервис">${[["settings", "⚙️ Настройки"], ["lessons", "📚 Уроки"], ["service", "🩺 Сервис"]].map(([k, l]) => `<a href="#${k}"${cur === k ? ' aria-current="page"' : ""}>${l}</a>`).join("")}</nav>`;
 
 function settingsPanel(st) {
   const { s } = st;
@@ -2419,7 +2680,7 @@ ${chatList.length ? `<details class="card"><summary>Собранные чаты 
 <p class="hint">Расписание в Cloudflare — <code>* * * * *</code> (каждую минуту); как часто проверять экзамен, задаётся в «Настройках».</p>`;
 }
 
-async function dashboard(env, origin, { tab = "home", msg = null, result = null, analysis = null, orders = {} } = {}) {
+async function dashboard(env, origin, { tab = "home", msg = null, result = null, analysis = null, orders = {}, openDay = null } = {}) {
   const st = await gatherStatus(env, origin);
   const toast = msg ? `<div class="toast${msg.bad ? " bad" : ""}" id="flash">${esc(msg.text)}</div>` : "";
   return page("MQM watch", `
@@ -2430,6 +2691,7 @@ ${toast}
 <div class="panel" id="p-house">${housePanel(env, st, origin)}</div>
 <div class="panel" id="p-analysis">${analysisPanel(env, st, analysis)}</div>
 <div class="panel" id="p-settings">${settingsPanel(st)}</div>
+<div class="panel" id="p-lessons">${lessonsPanel(env, st, openDay)}</div>
 <div class="panel" id="p-service">${servicePanel(env, st, origin, tab === "service" ? result : null)}</div>`, { tab });
 }
 
@@ -2494,10 +2756,10 @@ const TOGGLES = {
   weather_enabled: ["Утренний прогноз включён", "Утренний прогноз выключен"],
   cal_enabled: ["Календарь включён", "Календарь выключен"],
   cam_clean_enabled: ["Старые тревоги удаляются после 5 утра", "Старые тревоги не удаляются"],
+  sched_enabled: ["Сообщения об уроках включены", "Сообщения об уроках выключены"],
 };
 
-async function toggleSetting(request, env) {
-  const f = await request.formData();
+async function toggleSetting(f, env) {
   const key = String(f.get("key") || "");
   if (!TOGGLES[key]) throw new Error("Неизвестный переключатель");
   const on = f.getAll("v").includes("on");
@@ -2588,6 +2850,11 @@ export default {
       }
     }
     if (env.MQM_KV) {
+      try {
+        await runLessons(env, s);
+      } catch (e) {
+        console.log("ОШИБКА уроков:", e.message);
+      }
       try {
         await runCameraCleanup(env, s);
       } catch (e) {
@@ -2696,11 +2963,11 @@ export default {
       });
     }
 
-    if (!["/", "/save", "/toggle", "/action", "/analyze", "/house"].includes(path)) return new Response("Not found", { status: 404 });
+    if (!["/", "/save", "/toggle", "/action", "/analyze", "/house", "/lessons"].includes(path)) return new Response("Not found", { status: 404 });
     if (!(await isAuthed(request, env))) return loginPage();
-    const back = (tab, text, bad = false) => new Response(null, {
+    const back = (tab, text, bad = false, extra = "") => new Response(null, {
       status: 303,
-      headers: { Location: `/?msg=${encodeURIComponent(text)}${bad ? "&bad=1" : ""}#${tab}` },
+      headers: { Location: `/?msg=${encodeURIComponent(text)}${bad ? "&bad=1" : ""}${extra}#${tab}` },
     });
 
     if (path === "/save" && request.method === "POST") {
@@ -2712,10 +2979,22 @@ export default {
     }
 
     if (path === "/toggle" && request.method === "POST") {
+      const form = await request.formData();
+      const tab = TABS.includes(String(form.get("tab"))) ? String(form.get("tab")) : "home";
       try {
-        return back("home", await toggleSetting(request, env));
+        return back(tab, await toggleSetting(form, env));
       } catch (e) {
-        return back("home", e.message, true);
+        return back(tab, e.message, true);
+      }
+    }
+
+    if (path === "/lessons" && request.method === "POST") {
+      const form = await request.formData();
+      const extra = form.get("do") === "day_save" ? `&open=${encodeURIComponent(String(form.get("day")))}` : ""; // правленый день остаётся открытым
+      try {
+        return back("lessons", await lessonsAction(env, form), false, extra);
+      } catch (e) {
+        return back("lessons", e.message, true, extra);
       }
     }
 
@@ -2756,6 +3035,7 @@ export default {
       tab: TABS.includes(q.get("tab")) ? q.get("tab") : "home",
       msg: text ? { text, bad: q.get("bad") === "1" } : null,
       orders: { date: q.get("date"), span: q.get("span") },
+      openDay: q.get("open"),
     });
   },
 };
