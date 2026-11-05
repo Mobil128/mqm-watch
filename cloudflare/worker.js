@@ -264,8 +264,19 @@ async function apiCall(c, method, payload) {
     body: JSON.stringify(payload),
   });
   const raw = await res.text();
+  if (res.status === 466 || raw.includes("QUOTE_EXCEEDED")) {
+    // месячный лимит тарифа: повторять удаления бессмысленно, пока не сменится месяц или тариф
+    if (c.kv) await c.kv.put("green_quota_until", String(Date.now() + 24 * 3600000), { expirationTtl: 86400 });
+    const e = new Error("Лимит Green API на этом тарифе исчерпан — удаление сообщений временно остановлено");
+    e.quota = true;
+    throw e;
+  }
   if (!res.ok) throw new Error(`Green API ${method} ${res.status}: ${raw}`);
   return raw ? JSON.parse(raw) : null;
+}
+
+async function quotaBlocked(c) {
+  return !!c.kv && Number(await c.kv.get("green_quota_until")) > Date.now();
 }
 
 async function send(c, message) {
@@ -292,6 +303,10 @@ const bakuTime = (ms) => {
 // Если сегодня не было сообщения с баллами — оставляет последнее более раннее.
 async function cleanupOld(c, dry) {
   c.acted = true;
+  if (!dry && (await quotaBlocked(c))) {
+    c.log("Уборка старых сообщений пропущена: лимит Green API исчерпан, повтор через сутки");
+    return;
+  }
   const now = bakuNow();
   const cutoff = (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - BAKU_OFFSET_MS) / 1000;
   const history = (await apiCall(c, "getChatHistory", { chatId: c.chat, count: c.cleanCount })) || [];
@@ -329,6 +344,10 @@ async function cleanupOld(c, dry) {
       deleted++;
       c.log(`  удалено ${label}`);
     } catch (e) {
+      if (e.quota) {
+        c.log("Лимит Green API исчерпан — остальные сообщения не трогаю, повтор через сутки");
+        break;
+      }
       if (String(e).includes("already was deleted")) {
         gone++; // в истории ещё числится, но уже удалено — это нормально
       } else {
@@ -639,10 +658,12 @@ async function cleanLessonMessages(env, s, now) {
   const batch = list.filter((m) => m.time < cutoff).slice(0, LESSON_CLEAN_BATCH);
   if (!batch.length) return;
   const c = config(env, s);
+  if (await quotaBlocked(c)) return; // сообщения остаются в очереди до восстановления лимита
   for (const m of batch) {
     try {
       await apiCall(c, "deleteMessage", { chatId: m.chat, idMessage: m.id, onlySenderDelete: false });
     } catch (e) {
+      if (e.quota) return;
       if (!String(e.message).includes("already was deleted")) console.log("Сообщение об уроке не удалено:", e.message);
     }
   }
@@ -1683,6 +1704,7 @@ async function runCameraCleanup(env, s, now = Date.now()) {
   const state = await env.MQM_KV.get("cam_clean", "json");
   if (!state || !state.queue?.length || now < state.nextAt) return;
   const c = config(env, s);
+  if (await quotaBlocked(c)) return;
   const batch = state.queue.slice(0, CAM_CLEAN_BATCH);
   let deleted = state.deleted || 0;
   for (const m of batch) {
@@ -1690,6 +1712,7 @@ async function runCameraCleanup(env, s, now = Date.now()) {
       await apiCall(c, "deleteMessage", { chatId: m.chat, idMessage: m.id, onlySenderDelete: false });
       deleted++;
     } catch (e) {
+      if (e.quota) return;
       // уже удалено — ок; старше 2 суток WhatsApp не даёт удалить — тоже пропускаем, чтобы очередь не застряла
       if (!String(e.message).includes("already was deleted")) console.log("Тревога не удалена:", e.message);
     }
@@ -1722,6 +1745,7 @@ async function purgeCameraAlerts(env, s) {
       await apiCall(c, "deleteMessage", { chatId: chat, idMessage: m.idMessage, onlySenderDelete: false });
       deleted++;
     } catch (e) {
+      if (e.quota) throw e;
       if (String(e.message).includes("already was deleted")) gone++;
       else { failed++; c.log(`не удалось: ${e.message.slice(0, 120)}`); }
     }
