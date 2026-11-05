@@ -85,6 +85,7 @@ function defaults(env) {
     cal_holidays: "",
     cal_hour: 8,
     cal_tomorrow: true,
+    auto_delete: false,
     sched_enabled: false,
     sched_before: 0,
     sched_chat: "",
@@ -477,7 +478,7 @@ async function dailyWeather(c, force) {
 
 async function sendForecast(c, force, now, today) {
   let cleanError = null;
-  if (c.s.clean_enabled) {
+  if (c.s.clean_enabled && c.s.auto_delete) {
     try {
       await cleanupOld(c, force);
     } catch (e) { // сбой уборки не должен лишать прогноза
@@ -485,7 +486,7 @@ async function sendForecast(c, force, now, today) {
       c.log("ОШИБКА уборки:", e.message);
     }
   } else {
-    c.log("Уборка старых сообщений выключена");
+    c.log("Автоудаление выключено: вчерашние сообщения не удаляются");
   }
   const tomorrow = ymd(addHours(now, 24));
   await send(c, fmtWeather(c, await fetchWeather(c, today, tomorrow), now));
@@ -653,6 +654,7 @@ async function rememberLessonMessage(env, chat, idMessage, time) {
 
 // Удаляет сообщения об уроках, отправленные до сегодняшней полуночи (по Баку), по нескольку за минуту.
 async function cleanLessonMessages(env, s, now) {
+  if (!s.auto_delete) return;
   const list = (await env.MQM_KV.get("lesson_msgs", "json")) || [];
   const cutoff = bakuAt(now, 0);
   const batch = list.filter((m) => m.time < cutoff).slice(0, LESSON_CLEAN_BATCH);
@@ -1688,7 +1690,7 @@ async function rememberCameraMessage(env, chat, idMessage, time) {
 }
 
 async function startCameraCleanup(env, s, now) {
-  if (!s.cam_clean_enabled || now < bakuAt(now, CAM_CLEAN_HOUR)) return;
+  if (!s.auto_delete || !s.cam_clean_enabled || now < bakuAt(now, CAM_CLEAN_HOUR)) return;
   const day = ymd(new Date(now + BAKU_OFFSET_MS));
   const state = await env.MQM_KV.get("cam_clean", "json");
   if (state && state.day === day) return;
@@ -1701,6 +1703,7 @@ async function startCameraCleanup(env, s, now) {
 }
 
 async function runCameraCleanup(env, s, now = Date.now()) {
+  if (!s.auto_delete) return;
   const state = await env.MQM_KV.get("cam_clean", "json");
   if (!state || !state.queue?.length || now < state.nextAt) return;
   const c = config(env, s);
@@ -2666,7 +2669,7 @@ function settingsPanel(st) {
 }
 
 function servicePanel(env, st, origin, result) {
-  const { last, lastHook, gState, gSettings, hookWhere, chatList, chats } = st;
+  const { s, last, lastHook, gState, gSettings, hookWhere, chatList, chats } = st;
   const v = env.CF_VERSION_METADATA;
   const flags = gSettings.v ? ["incomingWebhook", "outgoingWebhook", "outgoingAPIMessageWebhook"].filter((k) => gSettings.v[k] !== "yes") : [];
   const rows = [
@@ -2691,6 +2694,8 @@ ${actionButton("service", "webhook", "🔗 Подключить вебхук в 
 <section class="card">
 <h2>Действия</h2>
 <div class="btns">
+${toggleForm("auto_delete", s.auto_delete, "Автоудаление старых сообщений бота", "service")}
+<p class="hint">Выключено по умолчанию: вчерашние прогнозы, тревоги камер и сообщения об уроках бот не удаляет сам. Кнопки ниже работают всегда, но только по нажатию.</p>
 ${actionButton("service", "orders", "⛽ Найти заказы в собранных сообщениях")}
 ${actionButton("service", "cam_purge", "🧹 Удалить старые тревоги камер (фото и текст)", { cls: "danger", confirmText: "Удалить из группы все тревоги камер, отправленные до сегодняшних 05:00? Удалить можно только то, что WhatsApp ещё разрешает." })}
 ${actionButton("service", "dump", "🔍 Что бот видит на странице экзамена")}
@@ -2781,6 +2786,7 @@ const TOGGLES = {
   cal_enabled: ["Календарь включён", "Календарь выключен"],
   cam_clean_enabled: ["Старые тревоги удаляются после 5 утра", "Старые тревоги не удаляются"],
   sched_enabled: ["Сообщения об уроках включены", "Сообщения об уроках выключены"],
+  auto_delete: ["Автоудаление включено: бот сам удаляет старые сообщения", "Автоудаление выключено: бот ничего не удаляет сам"],
 };
 
 async function toggleSetting(f, env) {
