@@ -1551,7 +1551,7 @@ async function runCommand(env, s, text) {
   const cmd = parseCommand(text, targets);
   const example = targets[0] ? lower(targets[0].label) : "işıq";
   if (cmd.kind === "help") {
-    return `Komandalar:\n!${example} aç\n!${example} bağla\n!${example} 30 dəq — 30 dəqiqəlik aç\n!${example} — vəziyyət\n!cihazlar — siyahı`;
+    return helpReply(s);
   }
   if (cmd.kind === "list") return targets.length ? targets.map((t) => `• ${t.label} — ${stateAz(t)}`).join("\n") : "Cihaz əlavə olunmayıb.";
   if (cmd.kind === "unknown") return `Komandanı başa düşmədim. Kömək: !kömək`;
@@ -1564,6 +1564,186 @@ async function runCommand(env, s, text) {
   }
   await setTimer(env, t.id, t.code, 0, t.label);
   return `${t.label}: ${cmd.value ? "açıldı ✅" : "bağlandı ⏹"}`;
+}
+
+// ---------------- Команды из WhatsApp: справочные (без реле) ----------------
+// !dərs, !dərs sabah, !dərs həftə, !növbəti, !nəticə, !hava, !təqvim, !sifariş, !kamera, !status, !kömək.
+// Читают данные и отвечают в группу; реле не нужно, поэтому работают для всех участников основной группы.
+
+const fold = (x) => lower(x).replace(/ə/g, "e").replace(/ı/g, "i").replace(/ö/g, "o").replace(/ü/g, "u").replace(/ç/g, "c").replace(/ş/g, "s").replace(/ğ/g, "g");
+
+const INFO_WORDS = {
+  help: ["komek", "help", "помощь", "komandalar", "menu", "меню", "команды"],
+  lessons: ["ders", "dersler", "cedvel", "расписание", "уроки", "урок", "schedule"],
+  next: ["novbeti", "sonraki", "следующий", "next"],
+  scores: ["netice", "neticeler", "bal", "ballar", "баллы", "результаты", "imtahan", "экзамен"],
+  weather: ["hava", "weather", "погода"],
+  calendar: ["teqvim", "calendar", "календарь"],
+  orders: ["sifaris", "sifarisler", "заказ", "заказы", "benzin"],
+  camera: ["kamera", "камера", "kameralar"],
+  status: ["status", "статус"],
+};
+
+const DAY_WORDS = {
+  1: ["bazar ertesi", "понедельник"], 2: ["cersenbe axsami", "вторник"], 3: ["cersenbe", "среда"],
+  4: ["cume axsami", "четверг"], 5: ["cume", "пятница"], 6: ["senbe", "суббота"], 0: ["bazar", "воскресенье"],
+};
+const dayName = (d) => WEEKDAYS[(d + 6) % 7];
+
+// null — это не справочная команда (значит, реле или непонятно)
+function parseInfo(text, s) {
+  const body = fold(String(text || "").trim().replace(/^!\s*/, ""));
+  if (!body) return null;
+  const labels = [];
+  for (const dev of s.tuya_devices || []) {
+    const codes = dev.codes || [];
+    codes.forEach((code) => labels.push(fold(swLabel(dev, code, codes.length))));
+  }
+  if (labels.some((l) => body === l || body.startsWith(l + " "))) return null; // имя реле главнее
+  const [word, ...rest] = body.split(" ");
+  const arg = rest.join(" ");
+  for (const [kind, words] of Object.entries(INFO_WORDS)) if (words.includes(word)) return { kind, arg };
+  return null;
+}
+
+const lessonsOf = (list, day) => list.filter((l) => l.day === day).sort((a, b) => a.time.localeCompare(b.time));
+const lessonLine = (l, mark = "") => `${mark}${l.time}–${lessonEnd(l)}  ${l.subject}`;
+
+function lessonsReply(list, arg, nowD) {
+  const day = nowD.getUTCDay();
+  const mins = nowD.getUTCHours() * 60 + nowD.getUTCMinutes();
+  if (!list.length) return "📚 Dərs cədvəli boşdur.";
+  const dayBlock = (d, title, live) => {
+    const ls = lessonsOf(list, d);
+    if (!ls.length) return `📚 ${title} — ${dayName(d)}: dərs yoxdur 🎉`;
+    const rows = ls.map((l) => {
+      if (!live) return lessonLine(l);
+      const st = mins >= toMin(l.time) + l.duration ? "✅ " : mins >= toMin(l.time) ? "▶️ " : "⏳ ";
+      return lessonLine(l, st);
+    });
+    return [`📚 ${title} — ${dayName(d)} (${ls.length} dərs)`, ...rows].join("\n");
+  };
+  const a = fold(arg);
+  if (["", "bu gun", "bugun", "indi", "сегодня", "today"].includes(a)) return dayBlock(day, "Bu gün", true);
+  if (["sabah", "завтра", "tomorrow"].includes(a)) return dayBlock((day + 1) % 7, "Sabah", false);
+  if (["hefte", "heftelik", "hamisi", "неделя", "week"].includes(a)) {
+    return ["📚 Həftəlik cədvəl", ...[1, 2, 3, 4, 5, 6, 0].map((d) => {
+      const ls = lessonsOf(list, d);
+      return ls.length ? `\n${dayName(d)}:\n${ls.map((l) => lessonLine(l)).join("\n")}` : `\n${dayName(d)}: —`;
+    })].join("\n");
+  }
+  if (["novbeti", "sonraki", "следующий", "next"].includes(a)) return nextLessonReply(list, nowD);
+  for (const [d, names] of Object.entries(DAY_WORDS)) if (names.includes(a)) return dayBlock(Number(d), "Cədvəl", false);
+  return "Başa düşmədim. Nümunə: !dərs · !dərs sabah · !dərs həftə · !dərs cümə · !növbəti";
+}
+
+function nextLessonReply(list, nowD) {
+  const mins = nowD.getUTCHours() * 60 + nowD.getUTCMinutes();
+  for (let off = 0; off < 8; off++) {
+    const d = (nowD.getUTCDay() + off) % 7;
+    const l = lessonsOf(list, d).find((x) => off > 0 || toMin(x.time) > mins);
+    if (l) {
+      const when = off === 0 ? "Bu gün" : off === 1 ? "Sabah" : dayName(d);
+      const left = off === 0 ? ` (${toMin(l.time) - mins} dəq sonra)` : "";
+      return `📚 Növbəti dərs: ${when}\n${lessonLine(l)}${left}`;
+    }
+  }
+  return "📚 Növbəti dərs tapılmadı.";
+}
+
+function scoresReply(state) {
+  if (!state || !state.subjects || !Object.keys(state.subjects).length) return "📊 Hələ nəticə yoxdur.";
+  const lines = [`📊 Yekun: ${num(state.total)} / ${state.max}`];
+  for (const [name, s] of Object.entries(state.subjects)) {
+    let line = `• ${name}: ${num(s.score)}`;
+    const parts = [["correct", "✅"], ["wrong", "❌"], ["unverified", "⏳"]].filter(([k]) => k in s).map(([k, i]) => `${i} ${s[k]}`);
+    if (parts.length) line += " (" + parts.join(" | ") + ")";
+    lines.push(line);
+  }
+  return lines.join("\n");
+}
+
+async function ordersReply(env) {
+  if (!firebaseReady(env)) return "⛽ Firebase qoşulmayıb.";
+  const tonight = nightOf(Date.now() / 1000);
+  const all = (await firebase(env, "GET", "/orders")) || {};
+  const list = Object.values(all).filter((o) => o && o.night === tonight).sort((a, b) => a.timestamp - b.timestamp);
+  if (!list.length) return `⛽ Bu gecə (${tonight.slice(8)}.${tonight.slice(5, 7)}) üçün sifariş yoxdur.`;
+  const lines = [`⛽ Bu gecəki sifarişlər (${list.length}):`, ...sumFuels(list).map(([f, l]) => `• ${f}: ${liters(l)} l`), ""];
+  for (const o of list) lines.push(`AZS №${o.station}: ${Object.entries(o.fuels || {}).sort(([a], [b]) => fuelSort(a, b)).map(([f, l]) => `${f} ${liters(l)}`).join(", ")}`);
+  return lines.join("\n");
+}
+
+async function cameraReply(env) {
+  if (!firebaseReady(env)) return "🚨 Firebase qoşulmayıb.";
+  const raw = (await firebase(env, "GET", "/camera_events", null, `orderBy=${encodeURIComponent('"$key"')}&limitToLast=5`)) || {};
+  const list = Object.values(raw).filter((e) => e && e.time).sort((a, b) => b.time - a.time);
+  if (!list.length) return "🚨 Kamera siqnalı yoxdur.";
+  return ["🚨 Son kamera siqnalları:", ...list.map((e) => {
+    const d = new Date(e.time + BAKU_OFFSET_MS);
+    return `• ${dm(d)} ${hm(d)} — ${String(e.text || e.camera || "").slice(0, 80)}`;
+  })].join("\n");
+}
+
+async function statusReply(env, s) {
+  const now = bakuNow();
+  const last = await env.MQM_KV.get("last_run", "json");
+  const lines = [
+    `🤖 Bot işləyir · ${dm(now)} ${hm(now)} (Bakı)`,
+    last ? `Son yoxlama: ${ago(last.time)} ${last.ok ? "✅" : "⚠️"}` : "Son yoxlama: hələ yoxdur",
+    `Dərs xatırlatmaları: ${s.sched_enabled ? "açıq" : "söndürülüb"}`,
+  ];
+  if (tuyaReady(env) && (s.tuya_devices || []).length) {
+    try { lines.push("Cihazlar:", ...(await liveTargets(env, s)).map((t) => `• ${t.label} — ${stateAz(t)}`)); } catch { /* Tuya недоступна */ }
+  }
+  return lines.join("\n");
+}
+
+function helpReply(s) {
+  const first = (s.tuya_devices || []).find((d) => (d.codes || []).length);
+  const ex = first ? lower(swLabel(first, first.codes[0], first.codes.length)) : "1";
+  return `📖 Komandalar (hamısı ! ilə başlayır)
+
+🔌 Rele:
+!${ex} aç — işə sal
+!${ex} bağla — söndür
+!${ex} 30 dəq — 30 dəqiqəlik aç
+!${ex} — vəziyyət
+!cihazlar — bütün cihazlar
+
+📚 Dərslər:
+!dərs — bu gün
+!dərs sabah — sabah
+!dərs həftə — həftəlik
+!dərs cümə — gün üzrə
+!növbəti — növbəti dərs
+
+📊 !nəticə — imtahan balları
+🌦 !hava — hava proqnozu
+📅 !təqvim — ad günləri, bayramlar
+⛽ !sifariş — bu gecəki sifarişlər
+🚨 !kamera — son kamera siqnalları
+🤖 !status — botun vəziyyəti
+📖 !kömək — bu siyahı
+
+Rusca da olar: !расписание, !баллы, !погода, !заказ, !помощь`;
+}
+
+async function runInfo(env, s, info) {
+  const c = config(env, s);
+  const nowD = bakuNow();
+  switch (info.kind) {
+    case "help": return helpReply(s);
+    case "lessons": return lessonsReply(await lessonsCacheGet(env), info.arg, nowD);
+    case "next": return nextLessonReply(await lessonsCacheGet(env), nowD);
+    case "scores": return scoresReply(await env.MQM_KV.get("state", "json"));
+    case "weather": return fmtWeather(c, await fetchWeather(c, ymd(nowD), ymd(addHours(nowD, 24))), nowD);
+    case "calendar": return (await calendarMessage(c, nowD)) || "📅 Bu gün və sabah üçün hadisə yoxdur.";
+    case "orders": return ordersReply(env);
+    case "camera": return cameraReply(env);
+    case "status": return statusReply(env, s);
+  }
+  return "Komandanı başa düşmədim. Kömək: !kömək";
 }
 
 // Любая команда («!…»), которую бот получил, но не выполнил, оставляет в журнале дома причину.
@@ -1595,6 +1775,19 @@ async function handleCommandInner(env, body) {
   if (dir !== "incoming" && dir !== "outgoing") return; // свои ответы бота (outgoing_api) не разбираем
   if (!text || !text.trim().startsWith("!") || !env.MQM_KV) return;
   const preview = text.trim().slice(0, 40);
+  const s0 = await loadSettings(env);
+  const info = parseInfo(text, s0);
+  if (info) {
+    // справочные команды: реле не нужно, отвечать может любой участник основной группы
+    const k = `cmd_${fbKey(body.idMessage)}`;
+    if (await env.MQM_KV.get(k)) return;
+    await env.MQM_KV.put(k, "1", { expirationTtl: 86400 });
+    let out, good = true;
+    try { out = await runInfo(env, s0, info); } catch (e) { good = false; out = `Xəta: ${e.message}`; }
+    await tuyaLog(env, `💬 ${body.senderData?.senderName || phoneDigits(body.senderData?.sender)}: ${preview} → ${out.split("\n")[0]}`, good);
+    await sendTo(env, s0, fromChat || mainChat, out);
+    return;
+  }
   if (!tuyaReady(env)) {
     await tuyaLog(env, `⏸ Команда «${preview}» получена, но секретов Tuya нет`, false);
     return;
@@ -1962,8 +2155,11 @@ ${ready && !h.devs.length ? "" : `<details><summary>Как это работае
   const help = (() => {
     const first = h.live.find((x) => x?.v?.switches.length);
     const ex = first ? lower(swLabel(h.devs[h.live.indexOf(first)], first.v.switches[0].code, first.v.switches.length)) : "işıq";
-    return `<ul class="cmds"><li><code>!${esc(ex)} aç</code> — включить</li><li><code>!${esc(ex)} bağla</code> — выключить</li><li><code>!${esc(ex)} 30 dəq</code> — включить на 30 минут</li><li><code>!${esc(ex)}</code> — состояние</li><li><code>!cihazlar</code> — все устройства</li><li><code>!kömək</code> — подсказка</li></ul>
-<p class="hint">Понимает и по-русски/английски: вкл/выкл, on/off, «30 мин».</p>`;
+    const c = (cmd, d) => `<li><code>${cmd}</code> — ${d}</li>`;
+    return `<ul class="cmds">${c(`!${esc(ex)} aç`, "включить реле")}${c(`!${esc(ex)} bağla`, "выключить")}${c(`!${esc(ex)} 30 dəq`, "включить на 30 минут")}${c(`!${esc(ex)}`, "состояние")}${c("!cihazlar", "все устройства")}
+${c("!dərs", "уроки сегодня")}${c("!dərs sabah", "уроки завтра")}${c("!dərs həftə", "вся неделя")}${c("!dərs cümə", "уроки по дню недели")}${c("!növbəti", "ближайший урок")}
+${c("!nəticə", "баллы экзамена")}${c("!hava", "прогноз погоды")}${c("!təqvim", "дни рождения и праздники")}${c("!sifariş", "заказы топлива на эту ночь")}${c("!kamera", "последние тревоги камер")}${c("!status", "состояние бота")}${c("!kömək", "список команд")}</ul>
+<p class="hint">Реле — только для номеров из списка ниже; остальные команды доступны всем в основной группе. Понимает и по-русски: !расписание, !баллы, !погода, !заказ, !помощь; вкл/выкл, «30 мин».</p>`;
   })();
 
   const wa = `<form class="card" method="post" action="/house">
