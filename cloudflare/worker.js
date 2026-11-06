@@ -1497,8 +1497,8 @@ async function sendTo(env, s, chatId, message) {
 // ---------------- Команды из WhatsApp ----------------
 // «!işıq aç», «!işıq bağla», «!işıq 30 dəq», «!işıq» (состояние), «!cihazlar», «!kömək».
 
-const CMD_ON = ["aç", "ac", "yandır", "yandir", "on", "вкл", "включи", "включить"];
-const CMD_OFF = ["bağla", "bagla", "söndür", "sondur", "off", "выкл", "выключи", "выключить"];
+const CMD_ON = ["aç", "ac", "yandır", "yandir", "yan", "işə", "ise", "işlət", "islet", "on", "вкл", "включи", "включить", "зажги"];
+const CMD_OFF = ["bağla", "bagla", "söndür", "sondur", "kəs", "kes", "dayandır", "dayandir", "stop", "off", "выкл", "выключи", "выключить", "погаси"];
 const CMD_STATUS = ["", "?", "vəziyyət", "veziyyet", "status", "статус"];
 const CMD_LIST = ["cihazlar", "devices", "устройства"];
 const CMD_HELP = ["kömək", "komek", "help", "помощь"];
@@ -1514,13 +1514,19 @@ function phoneDigits(x) {
 
 // targets: [{ label, id, code }] — разбор без обращения к Tuya.
 function parseCommand(text, targets) {
-  const body = lower(text).replace(/^!\s*/, "");
+  const body = lower(text).replace(/^[!\/]\s*/, "");
   if (CMD_HELP.includes(body)) return { kind: "help" };
   if (CMD_LIST.includes(body)) return { kind: "list" };
+  let body2 = body;
+  { // глагол впереди: «!aç 1», «!işıq yandır» и т.п. → «1 aç»
+    const w = body.split(" ");
+    if ((CMD_ON.includes(w[0]) || CMD_OFF.includes(w[0])) && w.length > 1) body2 = `${w.slice(1).join(" ")} ${w[0]}`;
+    if (w.length > 1 && w[0] === "işə" && w[1] === "sal") body2 = `${w.slice(2).join(" ")} aç`;
+  }
   const target = [...targets].sort((a, b) => b.label.length - a.label.length)
-    .find((t) => body === lower(t.label) || body.startsWith(lower(t.label) + " "));
+    .find((t) => body2 === lower(t.label) || body2.startsWith(lower(t.label) + " "));
   if (!target) return { kind: "unknown" };
-  const words = body.slice(lower(target.label).length).trim().split(" ").filter(Boolean);
+  const words = body2.slice(lower(target.label).length).trim().split(" ").filter(Boolean);
   if (CMD_STATUS.includes(words.join(" "))) return { kind: "status", target };
   let i = 0, value = null;
   if (CMD_ON.includes(words[0])) { value = true; i = 1; } else if (CMD_OFF.includes(words[0])) { value = false; i = 1; }
@@ -1573,16 +1579,19 @@ async function runCommand(env, s, text) {
 const fold = (x) => lower(x).replace(/ə/g, "e").replace(/ı/g, "i").replace(/ö/g, "o").replace(/ü/g, "u").replace(/ç/g, "c").replace(/ş/g, "s").replace(/ğ/g, "g");
 
 const INFO_WORDS = {
-  help: ["komek", "help", "помощь", "komandalar", "menu", "меню", "команды"],
-  lessons: ["ders", "dersler", "cedvel", "расписание", "уроки", "урок", "schedule"],
-  next: ["novbeti", "sonraki", "следующий", "next"],
-  scores: ["netice", "neticeler", "bal", "ballar", "баллы", "результаты", "imtahan", "экзамен"],
-  weather: ["hava", "weather", "погода"],
-  calendar: ["teqvim", "calendar", "календарь"],
-  orders: ["sifaris", "sifarisler", "заказ", "заказы", "benzin"],
-  camera: ["kamera", "камера", "kameralar"],
-  status: ["status", "статус"],
+  help: ["komek", "kömek", "help", "yardim", "komandalar", "komanda", "menu", "start", "помощь", "меню", "команды", "справка", "?"],
+  next: ["novbeti", "sonraki", "novbeti", "gelen", "следующий", "ближайший", "next"],
+  lessons: ["ders", "dersler", "derslerim", "cedvel", "cedveli", "расписание", "уроки", "урок", "schedule", "lessons", "lesson"],
+  scores: ["netice", "neticeler", "bal", "ballar", "imtahan", "yekun", "баллы", "балл", "результаты", "результат", "экзамен", "score", "scores", "result", "results", "exam"],
+  weather: ["hava", "havalar", "proqnoz", "weather", "погода", "прогноз"],
+  calendar: ["teqvim", "teqvimi", "bayram", "bayramlar", "dogum", "calendar", "календарь", "праздники"],
+  orders: ["sifaris", "sifarisler", "sifarish", "benzin", "yanacaq", "заказ", "заказы", "топливо", "order", "orders", "fuel"],
+  camera: ["kamera", "kameralar", "siqnal", "teveqqo", "камера", "камеры", "тревоги", "camera", "cameras"],
+  status: ["status", "veziyyet", "vəziyyət", "bot", "статус", "состояние"],
 };
+const INFO_PRIORITY = ["help", "next", "scores", "weather", "calendar", "orders", "camera", "status", "lessons"];
+// слова-уточнения дня, которые сами по себе значат «расписание»
+const DAY_ONLY = ["sabah", "bugun", "indi", "hefte", "heftelik", "завтра", "сегодня", "неделя", "today", "tomorrow", "week"];
 
 const DAY_WORDS = {
   1: ["bazar ertesi", "понедельник"], 2: ["cersenbe axsami", "вторник"], 3: ["cersenbe", "среда"],
@@ -1592,7 +1601,7 @@ const dayName = (d) => WEEKDAYS[(d + 6) % 7];
 
 // null — это не справочная команда (значит, реле или непонятно)
 function parseInfo(text, s) {
-  const body = fold(String(text || "").trim().replace(/^!\s*/, ""));
+  const body = fold(String(text || "").trim().replace(/^[!\/]\s*/, ""));
   if (!body) return null;
   const labels = [];
   for (const dev of s.tuya_devices || []) {
@@ -1600,19 +1609,32 @@ function parseInfo(text, s) {
     codes.forEach((code) => labels.push(fold(swLabel(dev, code, codes.length))));
   }
   if (labels.some((l) => body === l || body.startsWith(l + " "))) return null; // имя реле главнее
-  const [word, ...rest] = body.split(" ");
-  const arg = rest.join(" ");
-  for (const [kind, words] of Object.entries(INFO_WORDS)) if (words.includes(word)) return { kind, arg };
+  const tokens = body.replace(/[?!.,]/g, " ").split(" ").filter(Boolean);
+  const hit = (kind) => tokens.findIndex((w) => INFO_WORDS[kind].map(fold).includes(w));
+  for (const kind of INFO_PRIORITY) {
+    const i = hit(kind);
+    if (i < 0) continue;
+    const arg = tokens.filter((_, j) => j !== i).join(" ");
+    if (kind === "lessons" && /\bnovbeti\b/.test(body)) return { kind: "next", arg: "" };
+    return { kind, arg };
+  }
+  if (tokens.length <= 3 && tokens.some((w) => DAY_ONLY.includes(w) || Object.values(DAY_WORDS).flat().includes(w))) return { kind: "lessons", arg: tokens.join(" ") };
   return null;
 }
 
 const lessonsOf = (list, day) => list.filter((l) => l.day === day).sort((a, b) => a.time.localeCompare(b.time));
 const lessonLine = (l, mark = "") => `${mark}${l.time}–${lessonEnd(l)}  ${l.subject}`;
 
-function lessonsReply(list, arg, nowD) {
+function lessonsReply(list, arg, nowD, week) {
   const day = nowD.getUTCDay();
   const mins = nowD.getUTCHours() * 60 + nowD.getUTCMinutes();
   if (!list.length) return "📚 Dərs cədvəli boşdur.";
+  if (week) {
+    return ["📚 Həftəlik cədvəl", ...[1, 2, 3, 4, 5, 6, 0].map((d) => {
+      const ls = lessonsOf(list, d);
+      return ls.length ? `\n${dayName(d)}:\n${ls.map((l) => lessonLine(l)).join("\n")}` : `\n${dayName(d)}: —`;
+    })].join("\n");
+  }
   const dayBlock = (d, title, live) => {
     const ls = lessonsOf(list, d);
     if (!ls.length) return `📚 ${title} — ${dayName(d)}: dərs yoxdur 🎉`;
@@ -1623,17 +1645,13 @@ function lessonsReply(list, arg, nowD) {
     });
     return [`📚 ${title} — ${dayName(d)} (${ls.length} dərs)`, ...rows].join("\n");
   };
-  const a = fold(arg);
-  if (["", "bu gun", "bugun", "indi", "сегодня", "today"].includes(a)) return dayBlock(day, "Bu gün", true);
-  if (["sabah", "завтра", "tomorrow"].includes(a)) return dayBlock((day + 1) % 7, "Sabah", false);
-  if (["hefte", "heftelik", "hamisi", "неделя", "week"].includes(a)) {
-    return ["📚 Həftəlik cədvəl", ...[1, 2, 3, 4, 5, 6, 0].map((d) => {
-      const ls = lessonsOf(list, d);
-      return ls.length ? `\n${dayName(d)}:\n${ls.map((l) => lessonLine(l)).join("\n")}` : `\n${dayName(d)}: —`;
-    })].join("\n");
-  }
-  if (["novbeti", "sonraki", "следующий", "next"].includes(a)) return nextLessonReply(list, nowD);
-  for (const [d, names] of Object.entries(DAY_WORDS)) if (names.includes(a)) return dayBlock(Number(d), "Cədvəl", false);
+  const a = fold(arg).replace(/\b(bu|на|для|gun|gunu|bu gun)\b/g, (m) => (m === "bu" || m === "gun" || m === "gunu" ? "" : m)).replace(/\s+/g, " ").trim();
+  const has = (...w) => w.some((x) => new RegExp(`(^| )${x}( |$)`).test(a));
+  if (has("hefte", "heftelik", "hamisi", "butun", "неделя", "неделю", "week", "weekly")) return lessonsReply(list, "hefte_", nowD, true);
+  if (has("sabah", "завтра", "tomorrow")) return dayBlock((day + 1) % 7, "Sabah", false);
+  if (has("novbeti", "sonraki", "следующий", "next")) return nextLessonReply(list, nowD);
+  for (const [d, names] of Object.entries(DAY_WORDS).sort((x, y) => y[1][0].length - x[1][0].length)) if (names.some((n) => a.includes(n))) return dayBlock(Number(d), "Cədvəl", false);
+  if (a === "" || has("indi", "bugun", "сегодня", "today")) return dayBlock(day, "Bu gün", true);
   return "Başa düşmədim. Nümunə: !dərs · !dərs sabah · !dərs həftə · !dərs cümə · !növbəti";
 }
 
@@ -1764,16 +1782,16 @@ async function handleCommandInner(env, body) {
   const fromChat = body.senderData?.chatId || "";
   if (mainChat && fromChat && fromChat !== mainChat) {
     // команды и ответы — только в основной группе
-    if (text && text.trim().startsWith("!") && env.MQM_KV) await tuyaLog(env, `⛔ команда «${text.trim().slice(0, 40)}» из другого чата — не выполнена`, false);
+    if (text && /^(!\s*|\/)\S/.test(text.trim()) && env.MQM_KV) await tuyaLog(env, `⛔ команда «${text.trim().slice(0, 40)}» из другого чата — не выполнена`, false);
     return;
   }
-  if (text && text.trim().startsWith("!") && env.MQM_KV) {
+  if (text && /^(!\s*|\/)\S/.test(text.trim()) && env.MQM_KV) {
     // фиксируем каждую команду сразу, чтобы в журнале было видно, дошла ли она до бота
     const who = phoneDigits(String(body.senderData?.sender || "").replace(/@.*/, "")) || "?";
     await tuyaLog(env, `📨 команда «${text.trim().slice(0, 40)}» от +${who} (${body.typeWebhook})`, true);
   }
   if (dir !== "incoming" && dir !== "outgoing") return; // свои ответы бота (outgoing_api) не разбираем
-  if (!text || !text.trim().startsWith("!") || !env.MQM_KV) return;
+  if (!text || !/^(!\s*|\/)\S/.test(text.trim()) || !env.MQM_KV) return;
   const preview = text.trim().slice(0, 40);
   const s0 = await loadSettings(env);
   const info = parseInfo(text, s0);
