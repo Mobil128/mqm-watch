@@ -1845,12 +1845,26 @@ async function handleCommandInner(env, body) {
 
 // ---------------- Фото дня ----------------
 // Фото с подписью «!foto» в основной группе (с телефона бота или с номеров из «Кому можно») попадает в очередь.
-// Картинки лежат в R2 (привязка PHOTOS), очередь — в KV photo_queue. Раз в день в заданное время
+// Картинки лежат в KV (ключи img:queue/…) или в R2, если подключена привязка PHOTOS; очередь — в KV photo_queue. Раз в день в заданное время
 // бот отправляет в основную группу первое фото из очереди, без подписи, и убирает его из очереди.
 
 const PHOTO_MARK = ["foto", "fotolar", "sekil", "şəkil", "фото", "photo"];
 const PHOTO_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
-const photoReady = (env) => !!env.PHOTOS;
+const photoReady = (env) => !!(env.PHOTOS || env.MQM_KV);
+const MAX_PHOTO = 20_000_000; // байт; в KV одно значение — до 25 МиБ
+
+// Одинаковый доступ к картинкам в R2 и в KV: get → { bytes, type } | null
+const photoStore = (env) => (env.PHOTOS
+  ? {
+    put: (k, bytes, type) => env.PHOTOS.put(k, bytes, { httpMetadata: { contentType: type } }),
+    get: async (k) => { const o = await env.PHOTOS.get(k); return o ? { bytes: new Uint8Array(await o.arrayBuffer()), type: o.httpMetadata?.contentType || "image/jpeg" } : null; },
+    delete: (k) => env.PHOTOS.delete(k),
+  }
+  : {
+    put: (k, bytes, type) => env.MQM_KV.put(`img:${k}`, bytes, { metadata: { type } }),
+    get: async (k) => { const r = await env.MQM_KV.getWithMetadata(`img:${k}`, "arrayBuffer"); return r?.value ? { bytes: new Uint8Array(r.value), type: r.metadata?.type || "image/jpeg" } : null; },
+    delete: (k) => env.MQM_KV.delete(`img:${k}`),
+  });
 const photoQueue = async (env) => (await env.MQM_KV.get("photo_queue", "json")) || [];
 const savePhotoQueue = (env, q) => env.MQM_KV.put("photo_queue", JSON.stringify(q));
 
@@ -1863,8 +1877,9 @@ const isPhotoMark = (caption) => {
 async function addPhoto(env, bytes, type, from, source) {
   const kind = sniffImage(bytes);
   if (!kind) throw new Error("файл не похож на картинку (jpg/png/gif/webp)");
+  if (bytes.length > MAX_PHOTO) throw new Error(`фото больше ${MAX_PHOTO / 1e6} МБ`);
   const key = `queue/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${kind[1]}`;
-  await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: kind[0] } });
+  await photoStore(env).put(key, bytes, kind[0]);
   const q = await photoQueue(env);
   q.push({ key, added: Date.now(), from: from || null, size: bytes.length, source });
   await savePhotoQueue(env, q);
@@ -1897,7 +1912,7 @@ async function handlePhoto(env, body) {
   if (await env.MQM_KV.get(dedupe)) return;
   await env.MQM_KV.put(dedupe, "1", { expirationTtl: 86400 });
   if (!photoReady(env)) {
-    await tuyaLog(env, `⏸ фото получено, но хранилище R2 (PHOTOS) не подключено`, false);
+    await tuyaLog(env, `⏸ фото получено, но хранилище не подключено`, false);
     return;
   }
   try {
@@ -1924,19 +1939,18 @@ async function sendPhotoBytes(env, s, bytes, type, name) {
   return raw ? JSON.parse(raw) : null;
 }
 
-// Отправить первое фото очереди. Пропавшие из R2 записи выбрасываются. null — очередь пуста.
+// Отправить первое фото очереди. Пропавшие из хранилища записи выбрасываются. null — очередь пуста.
 async function sendNextPhoto(env, s) {
   let q = await photoQueue(env);
   while (q.length) {
     const item = q[0];
-    const obj = await env.PHOTOS.get(item.key);
+    const obj = await photoStore(env).get(item.key);
     if (!obj) { q = q.slice(1); await savePhotoQueue(env, q); continue; }
-    const bytes = new Uint8Array(await obj.arrayBuffer());
-    const type = obj.httpMetadata?.contentType || "image/jpeg";
+    const { bytes, type } = obj;
     await sendPhotoBytes(env, s, bytes, type, item.key.split("/").pop());
     q = (await photoQueue(env)).filter((x) => x.key !== item.key); // очередь могла измениться за время отправки
     await savePhotoQueue(env, q);
-    await env.PHOTOS.delete(item.key);
+    await photoStore(env).delete(item.key);
     return { left: q.length };
   }
   return null;
@@ -1981,7 +1995,7 @@ async function photosAction(env, form, files) {
     await env.MQM_KV.put("settings", JSON.stringify({ ...(await loadSettings(env)), photo_time: time }));
     return `Время показа: ${time}`;
   }
-  if (!photoReady(env)) throw new Error("Хранилище R2 (PHOTOS) не подключено");
+  if (!photoReady(env)) throw new Error("Хранилище не подключено");
   const q = await photoQueue(env);
   const key = String(form.get("key") || "");
   const i = q.findIndex((x) => x.key === key);
@@ -1997,7 +2011,7 @@ async function photosAction(env, form, files) {
   }
   if (op === "delete") {
     if (i < 0) throw new Error("Фото уже нет в очереди");
-    await env.PHOTOS.delete(key);
+    await photoStore(env).delete(key);
     q.splice(i, 1);
     await savePhotoQueue(env, q);
     return "Фото удалено из очереди";
@@ -2032,7 +2046,7 @@ function photosCard(st) {
   return `<section class="card">
 <h2>🖼 Фото дня</h2>
 ${toggleForm("photo_enabled", s.photo_enabled, "Одно фото в группу каждый день", "photos")}
-<p class="meta">${photos.ready ? `В очереди: ${photos.queue.length} · следующее: ${photoNextText(s, photos.queue, photos.sentToday)}` : "Хранилище R2 не подключено"}</p>
+<p class="meta">${photos.ready ? `В очереди: ${photos.queue.length} · следующее: ${photoNextText(s, photos.queue, photos.sentToday)}` : "Хранилище не подключено"}</p>
 <a class="btn" href="#photos">🖼 Очередь фото</a>
 </section>`;
 }
@@ -2051,8 +2065,7 @@ ${toggleForm("photo_enabled", s.photo_enabled, "Одно фото в групп�
 <p class="hint">Как добавить: отправьте фото в основную группу с подписью <code>!foto</code> (с телефона бота или с номеров из «Кому можно» на вкладке «Дом»). В группу фото уйдёт без подписи. Пустая очередь — бот молчит.</p>
 </section>`;
   if (!photos.ready) {
-    return `${head}<section class="card"><h2>Нужно хранилище R2</h2>
-<ol class="steps"><li>Cloudflare → <b>R2 Object Storage</b> → включить (бесплатно до 10 ГБ).</li><li><b>Create bucket</b> → имя <code>mqm-photos</code> → Create.</li><li>Напишите в чат «бакет создан» — подключу его в коде.</li></ol></section>`;
+    return `${head}<section class="card"><h2>Нет хранилища</h2><p class="meta">Не подключено KV-хранилище MQM_KV.</p></section>`;
   }
   const last = photos.last ? `<p class="meta">Последний показ: ${ago(photos.last.time)} — <span class="${photos.last.ok ? "ok" : "bad"}">${esc(photos.last.text)}</span></p>` : "";
   const btn = (op, key, label, extra = "") => `<form method="post" action="/photos"><input type="hidden" name="do" value="${op}"><input type="hidden" name="key" value="${esc(key)}"><button class="btn small"${extra}>${label}</button></form>`;
@@ -3508,9 +3521,9 @@ export default {
     if (path === "/photo") { // превью фото из очереди (только для вошедших)
       const k = url.searchParams.get("k") || "";
       if (!photoReady(env) || !k.startsWith("queue/")) return new Response("Not found", { status: 404 });
-      const obj = await env.PHOTOS.get(k);
+      const obj = await photoStore(env).get(k);
       if (!obj) return new Response("Not found", { status: 404 });
-      return new Response(obj.body, { headers: { "Content-Type": obj.httpMetadata?.contentType || "image/jpeg", "Cache-Control": "private, max-age=86400" } });
+      return new Response(obj.bytes, { headers: { "Content-Type": obj.type, "Cache-Control": "private, max-age=86400" } });
     }
 
     if (path === "/photos" && request.method === "POST") {
