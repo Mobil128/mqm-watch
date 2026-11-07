@@ -89,6 +89,8 @@ function defaults(env) {
     sched_enabled: false,
     sched_before: 0,
     sched_chat: "",
+    photo_enabled: false,
+    photo_time: "09:00",
   };
 }
 
@@ -1588,8 +1590,9 @@ const INFO_WORDS = {
   orders: ["sifaris", "sifarisler", "sifarish", "benzin", "yanacaq", "заказ", "заказы", "топливо", "order", "orders", "fuel"],
   camera: ["kamera", "kameralar", "siqnal", "teveqqo", "камера", "камеры", "тревоги", "camera", "cameras"],
   status: ["status", "veziyyet", "vəziyyət", "bot", "статус", "состояние"],
+  photos: ["foto", "fotolar", "sekil", "sekiller", "фото", "photo", "photos"],
 };
-const INFO_PRIORITY = ["help", "next", "scores", "weather", "calendar", "orders", "camera", "status", "lessons"];
+const INFO_PRIORITY = ["help", "photos", "next", "scores", "weather", "calendar", "orders", "camera", "status", "lessons"];
 // слова-уточнения дня, которые сами по себе значат «расписание»
 const DAY_ONLY = ["sabah", "bugun", "indi", "hefte", "heftelik", "завтра", "сегодня", "неделя", "today", "tomorrow", "week"];
 
@@ -1742,6 +1745,8 @@ function helpReply(s) {
 ⛽ !sifariş — bu gecəki sifarişlər
 🚨 !kamera — son kamera siqnalları
 🤖 !status — botun vəziyyəti
+🖼 !foto — növbədəki şəkillər
+   (şəkli "!foto" yazısı ilə göndər — növbəyə düşər)
 📖 !kömək — bu siyahı
 
 Rusca da olar: !расписание, !баллы, !погода, !заказ, !помощь`;
@@ -1760,6 +1765,7 @@ async function runInfo(env, s, info) {
     case "orders": return ordersReply(env);
     case "camera": return cameraReply(env);
     case "status": return statusReply(env, s);
+    case "photos": return photoInfoReply(env, s);
   }
   return "Komandanı başa düşmədim. Kömək: !kömək";
 }
@@ -1775,6 +1781,7 @@ async function handleCommand(env, body) {
 }
 
 async function handleCommandInner(env, body) {
+  if (body.messageData?.typeMessage === "imageMessage" && isPhotoMark(body.messageData?.fileMessageData?.caption)) return; // это фото для очереди — им занимается handlePhoto
   const dir = MESSAGE_WEBHOOKS[body.typeWebhook];
   const text = messageText(body.messageData);
   let mainChat = (env.GREEN_CHAT_ID || "").trim();
@@ -1834,6 +1841,242 @@ async function handleCommandInner(env, body) {
   }
   await tuyaLog(env, `💬 ${sd.senderName || phoneDigits(sd.sender)}: ${text.trim()} → ${reply.split("\n")[0]}`, ok);
   if (s.tuya_wa_reply) await sendTo(env, s, fromChat || mainChat, `🔌 ${reply}`);
+}
+
+// ---------------- Фото дня ----------------
+// Фото с подписью «!foto» в основной группе (с телефона бота или с номеров из «Кому можно») попадает в очередь.
+// Картинки лежат в R2 (привязка PHOTOS), очередь — в KV photo_queue. Раз в день в заданное время
+// бот отправляет в основную группу первое фото из очереди, без подписи, и убирает его из очереди.
+
+const PHOTO_MARK = ["foto", "fotolar", "sekil", "şəkil", "фото", "photo"];
+const PHOTO_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const photoReady = (env) => !!env.PHOTOS;
+const photoQueue = async (env) => (await env.MQM_KV.get("photo_queue", "json")) || [];
+const savePhotoQueue = (env, q) => env.MQM_KV.put("photo_queue", JSON.stringify(q));
+
+// подпись «!foto» (и варианты) — знак, что фото для очереди, а не обычное сообщение семье
+const isPhotoMark = (caption) => {
+  const w = fold(String(caption || "").trim().replace(/^(!\s*|\/)/, "")).split(" ")[0];
+  return /^(!\s*|\/)\S/.test(String(caption || "").trim()) && PHOTO_MARK.map(fold).includes(w);
+};
+
+async function addPhoto(env, bytes, type, from, source) {
+  const kind = sniffImage(bytes);
+  if (!kind) throw new Error("файл не похож на картинку (jpg/png/gif/webp)");
+  const key = `queue/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${kind[1]}`;
+  await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: kind[0] } });
+  const q = await photoQueue(env);
+  q.push({ key, added: Date.now(), from: from || null, size: bytes.length, source });
+  await savePhotoQueue(env, q);
+  return q.length;
+}
+
+// Вебхук: фото с подписью «!foto» из основной группы
+async function handlePhoto(env, body) {
+  const md = body.messageData || {};
+  if (md.typeMessage !== "imageMessage" || !env.MQM_KV) return;
+  const dir = MESSAGE_WEBHOOKS[body.typeWebhook];
+  if (dir !== "incoming" && dir !== "outgoing") return;
+  const caption = md.fileMessageData?.caption;
+  if (!isPhotoMark(caption)) return;
+  let mainChat = (env.GREEN_CHAT_ID || "").trim();
+  if (mainChat && !mainChat.includes("@")) mainChat += "@g.us";
+  const sd = body.senderData || {};
+  const from = phoneDigits(String(sd.sender || "").replace(/@.*/, ""));
+  if (mainChat && sd.chatId !== mainChat) {
+    await tuyaLog(env, `⛔ фото из другого чата — в очередь не добавлено`, false);
+    return;
+  }
+  const s = await loadSettings(env);
+  const allowed = new Set(String(s.tuya_wa_numbers || "").split(/[,;\n]+/).map(phoneDigits).filter(Boolean));
+  if (dir === "incoming" && !allowed.has(from)) {
+    await tuyaLog(env, `🚫 фото от +${from || "?"} не принято: номера нет в «Кому можно»`, false);
+    return;
+  }
+  const dedupe = `photo_${fbKey(body.idMessage)}`;
+  if (await env.MQM_KV.get(dedupe)) return;
+  await env.MQM_KV.put(dedupe, "1", { expirationTtl: 86400 });
+  if (!photoReady(env)) {
+    await tuyaLog(env, `⏸ фото получено, но хранилище R2 (PHOTOS) не подключено`, false);
+    return;
+  }
+  try {
+    const url = md.fileMessageData?.downloadUrl;
+    if (!url) throw new Error("в уведомлении нет ссылки на файл");
+    const res = await fetch(url); // ссылка Green API временная — скачиваем сразу
+    if (!res.ok) throw new Error(`файл не скачался: ${res.status}`);
+    const n = await addPhoto(env, new Uint8Array(await res.arrayBuffer()), null, from, "whatsapp");
+    await tuyaLog(env, `🖼 фото от +${from || "?"} добавлено в очередь (всего ${n})`, true);
+  } catch (e) {
+    await tuyaLog(env, `⚠️ фото не добавлено: ${e.message}`, false);
+  }
+}
+
+async function sendPhotoBytes(env, s, bytes, type, name) {
+  const c = config(env, s);
+  const form = new FormData();
+  form.append("chatId", c.chat);
+  form.append("fileName", name);
+  form.append("file", new Blob([bytes], { type }), name);
+  const res = await fetch(`${c.api}/waInstance${c.id}/sendFileByUpload/${c.token}`, { method: "POST", body: form });
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`Green API ${res.status}: ${raw.slice(0, 150)}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+// Отправить первое фото очереди. Пропавшие из R2 записи выбрасываются. null — очередь пуста.
+async function sendNextPhoto(env, s) {
+  let q = await photoQueue(env);
+  while (q.length) {
+    const item = q[0];
+    const obj = await env.PHOTOS.get(item.key);
+    if (!obj) { q = q.slice(1); await savePhotoQueue(env, q); continue; }
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    const type = obj.httpMetadata?.contentType || "image/jpeg";
+    await sendPhotoBytes(env, s, bytes, type, item.key.split("/").pop());
+    q = (await photoQueue(env)).filter((x) => x.key !== item.key); // очередь могла измениться за время отправки
+    await savePhotoQueue(env, q);
+    await env.PHOTOS.delete(item.key);
+    return { left: q.length };
+  }
+  return null;
+}
+
+async function runPhotos(env, s, now = Date.now()) {
+  if (!s.photo_enabled || !photoReady(env)) return;
+  const d = new Date(now + BAKU_OFFSET_MS);
+  const today = ymd(d);
+  if (hm(d) < s.photo_time || (await env.MQM_KV.get("photo_date")) === today) return;
+  if (now < (Number(await env.MQM_KV.get("photo_retry_at")) || 0)) return;
+  try {
+    const r = await sendNextPhoto(env, s);
+    await env.MQM_KV.put("photo_date", today); // пустая очередь — молчим до завтра
+    if (r) await env.MQM_KV.put("photo_last", JSON.stringify({ time: now, ok: true, text: `отправлено, в очереди осталось ${r.left}` }));
+  } catch (e) {
+    await env.MQM_KV.put("photo_retry_at", String(now + 15 * 60000), { expirationTtl: 3600 });
+    await env.MQM_KV.put("photo_last", JSON.stringify({ time: now, ok: false, text: e.message.slice(0, 200) }));
+  }
+}
+
+function photoNextText(s, q, sentToday) {
+  if (!s.photo_enabled) return "показ выключен";
+  if (!q.length) return "очередь пуста";
+  return `${sentToday ? "завтра" : "сегодня"} в ${s.photo_time}`;
+}
+
+async function photoInfoReply(env, s) {
+  if (!photoReady(env)) return "🖼 Şəkil anbarı qoşulmayıb.";
+  const q = await photoQueue(env);
+  if (!q.length) return "🖼 Növbədə şəkil yoxdur.";
+  const sent = (await env.MQM_KV.get("photo_date")) === ymd(bakuNow());
+  const when = !s.photo_enabled ? "göstərmə söndürülüb" : `növbəti: ${sent ? "sabah" : "bu gün"} ${s.photo_time}`;
+  return `🖼 Növbədə ${q.length} şəkil · ${when}`;
+}
+
+async function photosAction(env, form, files) {
+  const op = String(form.get("do") || "");
+  if (op === "settings_save") {
+    const time = String(form.get("photo_time") || "").trim();
+    if (!PHOTO_TIME_RE.test(time)) throw new Error("Время — в виде ЧЧ:ММ, например 09:00");
+    await env.MQM_KV.put("settings", JSON.stringify({ ...(await loadSettings(env)), photo_time: time }));
+    return `Время показа: ${time}`;
+  }
+  if (!photoReady(env)) throw new Error("Хранилище R2 (PHOTOS) не подключено");
+  const q = await photoQueue(env);
+  const key = String(form.get("key") || "");
+  const i = q.findIndex((x) => x.key === key);
+  if (op === "upload") {
+    let n = 0;
+    for (const f of files) {
+      if (!f || typeof f === "string" || !f.size) continue;
+      await addPhoto(env, new Uint8Array(await f.arrayBuffer()), f.type, null, "page");
+      n++;
+    }
+    if (!n) throw new Error("Файлы не выбраны");
+    return `Добавлено фото: ${n}`;
+  }
+  if (op === "delete") {
+    if (i < 0) throw new Error("Фото уже нет в очереди");
+    await env.PHOTOS.delete(key);
+    q.splice(i, 1);
+    await savePhotoQueue(env, q);
+    return "Фото удалено из очереди";
+  }
+  if (op === "up" || op === "down" || op === "first") {
+    if (i < 0) throw new Error("Фото уже нет в очереди");
+    const [item] = q.splice(i, 1);
+    const to = op === "first" ? 0 : op === "up" ? Math.max(0, i - 1) : Math.min(q.length, i + 1);
+    q.splice(to, 0, item);
+    await savePhotoQueue(env, q);
+    return "Порядок изменён";
+  }
+  if (op === "send_now") {
+    const r = await sendNextPhoto(env, await loadSettings(env));
+    if (!r) throw new Error("Очередь пуста");
+    await env.MQM_KV.put("photo_last", JSON.stringify({ time: Date.now(), ok: true, text: `отправлено вручную, осталось ${r.left}` }));
+    return `Фото отправлено в группу. В очереди осталось ${r.left}`;
+  }
+  if (op === "skip_today") {
+    await env.MQM_KV.put("photo_date", ymd(bakuNow()));
+    return "Сегодня фото не будет";
+  }
+  if (op === "unskip_today") {
+    await env.MQM_KV.delete("photo_date");
+    return "Сегодняшний показ снова в планах";
+  }
+  throw new Error("Неизвестное действие");
+}
+
+function photosCard(st) {
+  const { s, photos } = st;
+  return `<section class="card">
+<h2>🖼 Фото дня</h2>
+${toggleForm("photo_enabled", s.photo_enabled, "Одно фото в группу каждый день", "photos")}
+<p class="meta">${photos.ready ? `В очереди: ${photos.queue.length} · следующее: ${photoNextText(s, photos.queue, photos.sentToday)}` : "Хранилище R2 не подключено"}</p>
+<a class="btn" href="#photos">🖼 Очередь фото</a>
+</section>`;
+}
+
+function photosPanel(env, st) {
+  const { s, photos } = st;
+  const head = `${subnav("photos")}
+<section class="card">
+<h2>🖼 Фото дня</h2>
+${toggleForm("photo_enabled", s.photo_enabled, "Одно фото в группу каждый день", "photos")}
+<form method="post" action="/photos" class="adv">
+<input type="hidden" name="do" value="settings_save">
+<label>Во сколько (по Баку)<input type="time" name="photo_time" value="${esc(s.photo_time)}" required></label>
+<button class="btn">💾 Сохранить</button>
+</form>
+<p class="hint">Как добавить: отправьте фото в основную группу с подписью <code>!foto</code> (с телефона бота или с номеров из «Кому можно» на вкладке «Дом»). В группу фото уйдёт без подписи. Пустая очередь — бот молчит.</p>
+</section>`;
+  if (!photos.ready) {
+    return `${head}<section class="card"><h2>Нужно хранилище R2</h2>
+<ol class="steps"><li>Cloudflare → <b>R2 Object Storage</b> → включить (бесплатно до 10 ГБ).</li><li><b>Create bucket</b> → имя <code>mqm-photos</code> → Create.</li><li>Напишите в чат «бакет создан» — подключу его в коде.</li></ol></section>`;
+  }
+  const last = photos.last ? `<p class="meta">Последний показ: ${ago(photos.last.time)} — <span class="${photos.last.ok ? "ok" : "bad"}">${esc(photos.last.text)}</span></p>` : "";
+  const btn = (op, key, label, extra = "") => `<form method="post" action="/photos"><input type="hidden" name="do" value="${op}"><input type="hidden" name="key" value="${esc(key)}"><button class="btn small"${extra}>${label}</button></form>`;
+  const items = photos.queue.map((p, i) => `<li class="photo">
+<img src="/photo?k=${encodeURIComponent(p.key)}" alt="Фото ${i + 1}" loading="lazy">
+<div><b>${i + 1}.</b> <span class="meta">${dm(new Date(p.added + BAKU_OFFSET_MS))}${p.from ? ` · +${esc(p.from)}` : p.source === "page" ? " · со страницы" : ""}</span>
+<div class="acts">${i ? btn("first", p.key, "⏫") + btn("up", p.key, "▲") : ""}${i < photos.queue.length - 1 ? btn("down", p.key, "▼") : ""}${btn("delete", p.key, "🗑", ` data-confirm="Удалить фото из очереди?"`)}</div></div>
+</li>`).join("");
+  return `${head}
+<section class="card">
+<h2>Очередь (${photos.queue.length})</h2>
+<p class="meta">Следующее: ${photoNextText(s, photos.queue, photos.sentToday)}</p>
+${last}
+<div class="acts">
+${photos.queue.length ? `<form method="post" action="/photos"><input type="hidden" name="do" value="send_now"><button class="btn" data-confirm="Отправить первое фото в группу сейчас?">📤 Отправить сейчас</button></form>` : ""}
+${photos.sentToday ? `<form method="post" action="/photos"><input type="hidden" name="do" value="unskip_today"><button class="btn">↩️ Вернуть сегодняшний показ</button></form>` : `<form method="post" action="/photos"><input type="hidden" name="do" value="skip_today"><button class="btn">⏭ Пропустить сегодня</button></form>`}
+</div>
+${items ? `<ol class="photos">${items}</ol>` : `<p class="meta">Очередь пуста.</p>`}
+<form method="post" action="/photos" enctype="multipart/form-data" class="adv">
+<input type="hidden" name="do" value="upload">
+<label>Добавить с телефона<input type="file" name="file" accept="image/*" multiple required></label>
+<button class="btn">⬆️ Загрузить в конец очереди</button>
+</form>
+</section>`;
 }
 
 // ---------------- Дом: тревоги камер ----------------
@@ -2176,7 +2419,7 @@ ${ready && !h.devs.length ? "" : `<details><summary>Как это работае
     const c = (cmd, d) => `<li><code>${cmd}</code> — ${d}</li>`;
     return `<ul class="cmds">${c(`!${esc(ex)} aç`, "включить реле")}${c(`!${esc(ex)} bağla`, "выключить")}${c(`!${esc(ex)} 30 dəq`, "включить на 30 минут")}${c(`!${esc(ex)}`, "состояние")}${c("!cihazlar", "все устройства")}
 ${c("!dərs", "уроки сегодня")}${c("!dərs sabah", "уроки завтра")}${c("!dərs həftə", "вся неделя")}${c("!dərs cümə", "уроки по дню недели")}${c("!növbəti", "ближайший урок")}
-${c("!nəticə", "баллы экзамена")}${c("!hava", "прогноз погоды")}${c("!təqvim", "дни рождения и праздники")}${c("!sifariş", "заказы топлива на эту ночь")}${c("!kamera", "последние тревоги камер")}${c("!status", "состояние бота")}${c("!kömək", "список команд")}</ul>
+${c("!nəticə", "баллы экзамена")}${c("!hava", "прогноз погоды")}${c("!təqvim", "дни рождения и праздники")}${c("!sifariş", "заказы топлива на эту ночь")}${c("!kamera", "последние тревоги камер")}${c("!status", "состояние бота")}${c("!foto", "сколько фото в очереди (фото с подписью !foto — в очередь)")}${c("!kömək", "список команд")}</ul>
 <p class="hint">Реле — только для номеров из списка ниже; остальные команды доступны всем в основной группе. Понимает и по-русски: !расписание, !баллы, !погода, !заказ, !помощь; вкл/выкл, «30 мин».</p>`;
   })();
 
@@ -2364,7 +2607,7 @@ async function isAuthed(request, env) {
   return !!m && m[1] === (await authToken(env));
 }
 
-const TABS = ["home", "orders", "house", "analysis", "settings", "service", "lessons"];
+const TABS = ["home", "orders", "house", "analysis", "settings", "service", "lessons", "photos"];
 const NAV = ["home", "orders", "house", "analysis", "settings"]; // «Сервис» — внутри «Настроек»
 const INTERVALS = [5, 10, 15, 20, 30, 60, 120, 180, 360, 720, 1440];
 const intervalLabel = (m) => (m < 60 ? `каждые ${m} мин` : m === 60 ? "каждый час" : m === 1440 ? "раз в сутки" : `каждые ${m / 60} ч`);
@@ -2461,10 +2704,15 @@ input[type=date],input[type=time]{width:100%;padding:10px 12px;border:1px solid 
 .timerline{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 #p-home .timerline:not(.active){display:none}
 .btn.small{width:auto;padding:6px 12px;font-size:14px;font-weight:500;border-radius:999px}
+.photos{list-style:none;margin:8px 0;padding:0;display:grid;gap:10px}
+.photo{display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--line);padding-top:10px}
+.photo img{width:96px;height:96px;object-fit:cover;border-radius:10px;flex:none;background:var(--line)}
+.acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.acts form{margin:0}
 .steps{margin:0;padding-left:20px;display:grid;gap:6px;font-size:14px}
 .cmds{margin:0;padding-left:18px;display:grid;gap:4px;font-size:14px}
-.subnav{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px}
-.subnav a{text-align:center;padding:8px;border-radius:9px;text-decoration:none;color:var(--fg);font-size:15px}
+.subnav{display:grid;grid-template-columns:repeat(2,1fr);gap:4px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px}
+.subnav a{text-align:center;padding:8px 4px;white-space:nowrap;border-radius:9px;text-decoration:none;color:var(--fg);font-size:15px}
 .subnav a[aria-current=page]{background:var(--acc-soft);color:var(--acc);font-weight:600}
 .lrow{display:grid;gap:6px;padding:8px 0;border-top:1px solid var(--line)}
 .lrow:first-of-type{border-top:0;padding-top:0}
@@ -2490,12 +2738,12 @@ label.del input{width:18px;height:18px;accent-color:var(--bad)}
 // Вкладки, подтверждения и «Подождите…» на кнопках. Без JS все вкладки видны подряд.
 const CLIENT_JS = `
 (function(){
-  var tabs = ["home","orders","house","analysis","settings","service","lessons"];
+  var tabs = ["home","orders","house","analysis","settings","service","lessons","photos"];
   var start = document.body.getAttribute("data-tab") || "home";
   function show(t){
     if (tabs.indexOf(t) < 0) t = start;
     tabs.forEach(function(x){ var p = document.getElementById("p-" + x); if (p) p.hidden = x !== t; });
-    var navTab = (t === "service" || t === "lessons") ? "settings" : t;
+    var navTab = (t === "service" || t === "lessons" || t === "photos") ? "settings" : t;
     document.querySelectorAll(".nav a").forEach(function(a){ a.setAttribute("aria-current", a.getAttribute("data-tab") === navTab ? "page" : "false"); });
     window.scrollTo(0, 0);
   }
@@ -2544,7 +2792,7 @@ const ICONS = {
   service: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   orders: '<path d="M4 21V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v16M3 21h12M7 8h4M14 9h2a2 2 0 0 1 2 2v5a1.5 1.5 0 0 0 3 0V8l-3-3"/>',
 };
-const TAB_NAMES = { home: "Главная", orders: "Заказы", house: "Дом", analysis: "Анализ", settings: "Настройки", service: "Сервис", lessons: "Уроки" };
+const TAB_NAMES = { home: "Главная", orders: "Заказы", house: "Дом", analysis: "Анализ", settings: "Настройки", service: "Сервис", lessons: "Уроки", photos: "Фото дня" };
 
 function page(title, body, { tab = "home", status = 200, nav = true } = {}) {
   const navHtml = nav
@@ -2628,7 +2876,13 @@ async function gatherStatus(env, origin) {
     lessons = await lessonsCacheGet(env);
   }
   const lessonLast = kv ? await kv.get("lesson_last", "json") : null;
-  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook, lessons, lessonsErr: lessonsRaw.e || null, lessonLast };
+  const photos = { ready: photoReady(env) && !!kv, queue: [], sentToday: false, last: null };
+  if (photos.ready) {
+    photos.queue = await photoQueue(env);
+    photos.sentToday = (await kv.get("photo_date")) === ymd(bakuNow());
+    photos.last = await kv.get("photo_last", "json");
+  }
+  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook, lessons, lessonsErr: lessonsRaw.e || null, lessonLast, photos };
 }
 
 function problems(env, st) {
@@ -2689,6 +2943,7 @@ ${actionButton("home", "weather", "🌦 Прислать прогноз сейч
 ${calendarCard(st)}
 
 ${lessonsCard(st)}
+${photosCard(st)}
 
 ${ordersCard(st)}
 
@@ -2817,7 +3072,7 @@ ${env.GEMINI_API_KEY ? "" : `<p class="hint bad">Для «Разбора» и «
 </form>`;
 }
 
-const subnav = (cur) => `<nav class="subnav" aria-label="Настройки, уроки и сервис">${[["settings", "⚙️ Настройки"], ["lessons", "📚 Уроки"], ["service", "🩺 Сервис"]].map(([k, l]) => `<a href="#${k}"${cur === k ? ' aria-current="page"' : ""}>${l}</a>`).join("")}</nav>`;
+const subnav = (cur) => `<nav class="subnav" aria-label="Настройки, уроки и сервис">${[["settings", "⚙️ Настройки"], ["lessons", "📚 Уроки"], ["photos", "🖼 Фото"], ["service", "🩺 Сервис"]].map(([k, l]) => `<a href="#${k}"${cur === k ? ' aria-current="page"' : ""}>${l}</a>`).join("")}</nav>`;
 
 function settingsPanel(st) {
   const { s } = st;
@@ -2935,6 +3190,7 @@ ${toast}
 <div class="panel" id="p-analysis">${analysisPanel(env, st, analysis)}</div>
 <div class="panel" id="p-settings">${settingsPanel(st)}</div>
 <div class="panel" id="p-lessons">${lessonsPanel(env, st, openDay)}</div>
+<div class="panel" id="p-photos">${photosPanel(env, st)}</div>
 <div class="panel" id="p-service">${servicePanel(env, st, origin, tab === "service" ? result : null)}</div>`, { tab });
 }
 
@@ -3000,6 +3256,7 @@ const TOGGLES = {
   cal_enabled: ["Календарь включён", "Календарь выключен"],
   cam_clean_enabled: ["Старые тревоги удаляются после 5 утра", "Старые тревоги не удаляются"],
   sched_enabled: ["Сообщения об уроках включены", "Сообщения об уроках выключены"],
+  photo_enabled: ["Фото дня включено", "Фото дня выключено"],
   auto_delete: ["Автоудаление включено: бот сам удаляет старые сообщения", "Автоудаление выключено: бот ничего не удаляет сам"],
 };
 
@@ -3100,6 +3357,11 @@ export default {
         console.log("ОШИБКА уроков:", e.message);
       }
       try {
+        await runPhotos(env, s);
+      } catch (e) {
+        console.log("ОШИБКА фото дня:", e.message);
+      }
+      try {
         await runCameraCleanup(env, s);
       } catch (e) {
         console.log("ОШИБКА уборки тревог:", e.message);
@@ -3172,6 +3434,7 @@ export default {
         return new Response("Bad JSON", { status: 400 });
       }
       ctx.waitUntil(handleCommand(env, body).catch((e) => console.log("ОШИБКА команды:", e.message)));
+      ctx.waitUntil(handlePhoto(env, body).catch((e) => console.log("ОШИБКА фото:", e.message)));
       ctx.waitUntil(noteRawHook(env, body));
       try {
         await storeWebhook(env, body);
@@ -3207,7 +3470,7 @@ export default {
       });
     }
 
-    if (!["/", "/save", "/toggle", "/action", "/analyze", "/house", "/lessons"].includes(path)) return new Response("Not found", { status: 404 });
+    if (!["/", "/save", "/toggle", "/action", "/analyze", "/house", "/lessons", "/photos", "/photo"].includes(path)) return new Response("Not found", { status: 404 });
     if (!(await isAuthed(request, env))) return loginPage();
     const back = (tab, text, bad = false, extra = "") => new Response(null, {
       status: 303,
@@ -3239,6 +3502,23 @@ export default {
         return back("lessons", await lessonsAction(env, form), false, extra);
       } catch (e) {
         return back("lessons", e.message, true, extra);
+      }
+    }
+
+    if (path === "/photo") { // превью фото из очереди (только для вошедших)
+      const k = url.searchParams.get("k") || "";
+      if (!photoReady(env) || !k.startsWith("queue/")) return new Response("Not found", { status: 404 });
+      const obj = await env.PHOTOS.get(k);
+      if (!obj) return new Response("Not found", { status: 404 });
+      return new Response(obj.body, { headers: { "Content-Type": obj.httpMetadata?.contentType || "image/jpeg", "Cache-Control": "private, max-age=86400" } });
+    }
+
+    if (path === "/photos" && request.method === "POST") {
+      const form = await request.formData();
+      try {
+        return back("photos", await photosAction(env, form, form.getAll("file")));
+      } catch (e) {
+        return back("photos", e.message, true);
       }
     }
 
