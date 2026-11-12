@@ -1784,12 +1784,12 @@ const MAX_PHOTO = 20_000_000; // байт; в KV одно значение — �
 // Одинаковый доступ к картинкам в R2 и в KV: get → { bytes, type } | null
 const photoStore = (env) => (env.PHOTOS
   ? {
-    put: (k, bytes, type) => env.PHOTOS.put(k, bytes, { httpMetadata: { contentType: type } }),
+    put: (k, bytes, type) => env.PHOTOS.put(k, bytes, { httpMetadata: { contentType: type } }), // срок жизни в R2 — правилом жизненного цикла бакета
     get: async (k) => { const o = await env.PHOTOS.get(k); return o ? { bytes: new Uint8Array(await o.arrayBuffer()), type: o.httpMetadata?.contentType || "image/jpeg" } : null; },
     delete: (k) => env.PHOTOS.delete(k),
   }
   : {
-    put: (k, bytes, type) => env.MQM_KV.put(`img:${k}`, bytes, { metadata: { type } }),
+    put: (k, bytes, type, ttl) => env.MQM_KV.put(`img:${k}`, bytes, { metadata: { type }, ...(ttl ? { expirationTtl: ttl } : {}) }),
     get: async (k) => { const r = await env.MQM_KV.getWithMetadata(`img:${k}`, "arrayBuffer"); return r?.value ? { bytes: new Uint8Array(r.value), type: r.metadata?.type || "image/jpeg" } : null; },
     delete: (k) => env.MQM_KV.delete(`img:${k}`),
   });
@@ -2038,8 +2038,10 @@ function sniffImage(b) {
   return null;
 }
 
-async function sendCameraPhoto(env, s, chatId, caption, ev) {
-  const c = config(env, s);
+const CAMERA_IMAGE_TTL = 3 * 86400; // сколько секунд снимок тревоги живёт в KV и виден в приложении
+
+// Снимок из письма: base64 → байты, проверка размера и формата. Декодируем один раз на тревогу (лимит CPU на бесплатном плане).
+function decodeCameraImage(ev) {
   let bytes;
   try {
     bytes = Uint8Array.from(atob(String(ev.image)), (ch) => ch.charCodeAt(0));
@@ -2052,6 +2054,12 @@ async function sendCameraPhoto(env, s, chatId, caption, ev) {
   if (!kind) throw new Error("вложение не похоже на картинку (не jpg/png/gif/webp)");
   let name = String(ev.imageName || "snapshot").replace(/[^\w.-]/g, "_").slice(0, 60) || "snapshot";
   if (!/\.(jpe?g|png|gif|webp)$/i.test(name)) name += "." + kind[1];
+  return { bytes, kind, name };
+}
+
+async function sendCameraPhoto(env, s, chatId, caption, img) {
+  const c = config(env, s);
+  const { bytes, kind, name } = img;
   const form = new FormData();
   form.append("chatId", chatId || c.chat);
   form.append("caption", caption);
@@ -2073,6 +2081,10 @@ async function cameraEvent(env, ev) {
   // received — получен, но не пересылался, sent — ушёл в WhatsApp, failed — отправить не удалось (текст всё равно ушёл)
   let photo = ev.image ? "received" : String(ev.script || "") === "2" ? "noimage" : "";
   let photoError = "";
+  let img = null, imgError = "";
+  if (ev.image) {
+    try { img = decodeCameraImage(ev); } catch (e) { imgError = e.message; }
+  }
   if (!s.camera_forward) reason = "пересылка в WhatsApp выключена";
   else {
     const last = (await env.MQM_KV.get("camera_last", "json")) || {};
@@ -2082,7 +2094,8 @@ async function cameraEvent(env, ev) {
       let sentPhoto = false, photoReply = null;
       if (ev.image) {
         try {
-          photoReply = await sendCameraPhoto(env, s, s.camera_chat || null, `🕒 ${bakuTime(now)}`, ev);
+          if (!img) throw new Error(imgError || "снимок не разобран");
+          photoReply = await sendCameraPhoto(env, s, s.camera_chat || null, `🕒 ${bakuTime(now)}`, img);
           sentPhoto = true;
           photo = "sent";
         } catch (e) {
@@ -2097,8 +2110,19 @@ async function cameraEvent(env, ev) {
       forwarded = true;
     }
   }
+  // снимок сохраняем всегда (и если пересылка выключена или сработала пауза), чтобы его было видно в приложении
+  let image = null;
+  if (img && photoReady(env)) {
+    const key = `cam/${now}_${Math.random().toString(36).slice(2, 8)}.${img.kind[1]}`;
+    try {
+      await photoStore(env).put(key, img.bytes, img.kind[0], CAMERA_IMAGE_TTL);
+      image = key;
+    } catch (e) {
+      console.log("Снимок не сохранён:", e.message);
+    }
+  }
   if (firebaseReady(env)) {
-    await firebase(env, "PATCH", "/", { [`camera_events/${now}_${Math.random().toString(36).slice(2, 8)}`]: { time: now, camera, text, forwarded, photo, photoError: photoError || null } })
+    await firebase(env, "PATCH", "/", { [`camera_events/${now}_${Math.random().toString(36).slice(2, 8)}`]: { time: now, camera, text, forwarded, photo, photoError: photoError || null, image } })
       .catch((e) => console.log("Тревога не сохранена:", e.message));
   }
   return { forwarded, reason, photo, ...(photoError ? { photoError } : {}) };
@@ -2289,7 +2313,7 @@ ${c("!nəticə", "баллы экзамена")}${c("!hava", "прогноз п�
 <section class="card">
 <h2>Последние тревоги</h2>
 ${h.camError ? `<p class="bad">${esc(h.camError)}</p>` : h.camEvents.length
-    ? h.camEvents.map((e) => `<div class="row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small><br><small>${photoNote(e)}</small></span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("") + oldScriptHint(h.camEvents)
+    ? h.camEvents.map((e) => `<div class="row cam-row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small><br><small>${photoNote(e)}</small>${e.image ? `<a href="/photo?k=${encodeURIComponent(e.image)}" target="_blank"><img class="cam-img" loading="lazy" alt="Снимок тревоги" src="/photo?k=${encodeURIComponent(e.image)}"></a>` : ""}</span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("") + oldScriptHint(h.camEvents)
     : `<p class="meta">Пока не было.${firebaseReady(env) ? "" : " Список хранится в Firebase — он не настроен."}</p>`}
 <form method="post" action="/house"><input type="hidden" name="do" value="camera_test"><button class="btn" data-confirm="Отправить тестовую тревогу${s.camera_forward ? " в WhatsApp" : ""}?">🧪 Тестовая тревога</button></form>
 </section>
@@ -2477,6 +2501,9 @@ main{max-width:640px;margin:0 auto;padding:12px 16px 24px;display:grid;gap:12px}
 .row:first-of-type{border-top:0}
 .row>span:first-child{color:var(--mut)}
 .row>span:last-child{text-align:right;word-break:break-word}
+.cam-row>span:first-child{min-width:0;flex:1;overflow-wrap:anywhere}
+.cam-row>span:last-child{flex:none;white-space:nowrap}
+.cam-img{display:block;max-width:100%;max-height:260px;margin-top:8px;border-radius:10px}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
 label{display:grid;gap:4px;font-size:14px;color:var(--mut)}
 input[type=text],input[type=url],input[type=password],select,textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px}
@@ -3327,7 +3354,7 @@ export default {
 
     if (path === "/photo") { // превью фото из очереди (только для вошедших)
       const k = url.searchParams.get("k") || "";
-      if (!photoReady(env) || !k.startsWith("queue/")) return new Response("Not found", { status: 404 });
+      if (!photoReady(env) || !/^(queue|cam)\/[\w.-]+$/.test(k)) return new Response("Not found", { status: 404 });
       const obj = await photoStore(env).get(k);
       if (!obj) return new Response("Not found", { status: 404 });
       return new Response(obj.bytes, { headers: { "Content-Type": obj.type, "Cache-Control": "private, max-age=86400" } });
