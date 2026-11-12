@@ -282,6 +282,60 @@ async function quotaBlocked(c) {
   return !!c.kv && Number(await c.kv.get("green_quota_until")) > Date.now();
 }
 
+// ---------------- Журнал обрывов связи с Green API ----------------
+// Раз в CONN_CHECK_EVERY минут спрашиваем getStateInstance. В KV пишем только при смене состояния
+// (лимит бесплатного плана — 1000 записей в сутки), поэтому журнал почти ничего не стоит.
+// conn_state — текущее состояние; conn_log — последние 200 переходов {time, from, to, downMs?}.
+const CONN_CHECK_EVERY = 5;
+const CONN_LOG_MAX = 200;
+
+async function readConnState(c) {
+  for (let i = 0; i < 2; i++) { // одна повторная попытка, чтобы случайный сбой сети не считался обрывом
+    try {
+      const r = await apiCall(c, "getStateInstance");
+      return r?.stateInstance || "unknown";
+    } catch (e) {
+      if (i === 1) return "нет ответа: " + String(e.message).slice(0, 80);
+    }
+  }
+}
+
+async function checkConnection(env, s) {
+  const c = config(env, s);
+  if (!c.kv || !(c.id && c.token)) return;
+  const state = await readConnState(c);
+  const ok = state === "authorized";
+  const prev = await c.kv.get("conn_state", "json");
+  const prevOk = prev ? prev.state === "authorized" : null;
+  if (prev && prev.state === state) return; // ничего не изменилось — не пишем
+  const now = Date.now();
+  const log = (await c.kv.get("conn_log", "json")) || [];
+  const entry = { time: now, from: prev ? prev.state : null, to: state };
+  if (ok && prevOk === false && prev.downSince) entry.downMs = now - prev.downSince; // сколько длился обрыв
+  log.push(entry);
+  await c.kv.put("conn_log", JSON.stringify(log.slice(-CONN_LOG_MAX)));
+  await c.kv.put("conn_state", JSON.stringify({
+    state, time: now,
+    downSince: ok ? null : (prevOk === false && prev.downSince ? prev.downSince : now),
+  }));
+}
+
+// Сводка для страницы: сколько обрывов и сколько простоя за последние days суток.
+function connStats(log, days = 7) {
+  const since = Date.now() - days * 86400000;
+  const recent = (log || []).filter((e) => e.time >= since);
+  const drops = recent.filter((e) => e.to !== "authorized" && e.from === "authorized");
+  const downMs = recent.reduce((a, e) => a + (e.downMs || 0), 0);
+  const last = drops.length ? drops[drops.length - 1] : null;
+  return { drops: drops.length, downMs, last, recent };
+}
+
+function fmtDuration(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 60) return m + " мин";
+  return Math.floor(m / 60) + " ч " + (m % 60) + " мин";
+}
+
 async function send(c, message) {
   c.log("Green API:", await apiCall(c, "sendMessage", { chatId: c.chat, message }));
 }
@@ -2880,6 +2934,7 @@ async function gatherStatus(env, origin) {
   const cameraUrl = camToken ? `${origin}/camera/${camToken}` : null;
   const camClean = kv ? await kv.get("cam_clean", "json") : null;
   const rawHook = kv ? await kv.get("last_hook_raw", "json") : null;
+  const connLog = kv ? (await kv.get("conn_log", "json")) || [] : [];
   // расписание: основное — Firebase; KV-копию подтягиваем под него, при сбое базы показываем копию
   let lessons = [];
   if (lessonsRaw.v !== undefined) {
@@ -2895,7 +2950,7 @@ async function gatherStatus(env, origin) {
     photos.sentToday = (await kv.get("photo_date")) === ymd(bakuNow());
     photos.last = await kv.get("photo_last", "json");
   }
-  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook, lessons, lessonsErr: lessonsRaw.e || null, lessonLast, photos };
+  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook, connLog, lessons, lessonsErr: lessonsRaw.e || null, lessonLast, photos };
 }
 
 function problems(env, st) {
@@ -3158,6 +3213,12 @@ function servicePanel(env, st, origin, result) {
     ["Версия бота", v?.id ? `${esc(v.id.slice(0, 8))}${v.timestamp ? ` · ${bakuTime(Date.parse(v.timestamp))}` : ""}` : "неизвестно"],
     ["Секреты", secretsReport(env)],
     ["WhatsApp", gState.v ? (gState.v.stateInstance === "authorized" ? `<span class="ok">подключён</span>` : `<span class="bad">${esc(gState.v.stateInstance)}</span>`) : `<span class="bad">нет ответа</span>`],
+    ["Обрывы связи за 7 дней", (() => {
+      const t = connStats(st.connLog, 7);
+      if (!st.connLog.length) return "журнал пока пуст";
+      if (!t.drops) return `<span class=\"ok\">0</span>`;
+      return `<span class=\"bad\">${t.drops}</span> · простой ${fmtDuration(t.downMs)}<br><small>последний: ${bakuTime(t.last.time)} · ${esc(t.last.to)}</small>`;
+    })()],
     ["Вебхук в Green API", hookWhere === "ours" ? `<span class="ok">настроен</span>` : hookWhere === "other" ? `<span class="bad">другой адрес</span>` : hookWhere === "none" ? `<span class="bad">не задан</span>` : "—"],
     ["Последнее сообщение из чатов", st.rawHook ? `${ago(st.rawHook.time)} · ${esc(st.rawHook.type)}<br><small>от +${esc(st.rawHook.from)} · тип ${esc(st.rawHook.msgType)}<br>текст: ${st.rawHook.text == null ? "— нет" : `«${esc(st.rawHook.text)}»`}</small>` : "ещё не приходило"],
     ["Последнее сообщение", lastHook ? `${ago(lastHook.time)} · ${lastHook.ok ? `<span class="ok">сохранено</span>` : `<span class="bad">ошибка</span><br><small>${esc(lastHook.note)}</small>`}` : "ещё не приходило"],
@@ -3356,6 +3417,13 @@ function flag(params, name, def) {
 export default {
   async scheduled(event, env) {
     const s = await loadSettings(env);
+    if (env.MQM_KV && Math.floor(event.scheduledTime / 60000) % CONN_CHECK_EVERY === 0) {
+      try {
+        await checkConnection(env, s);
+      } catch (e) {
+        console.log("ОШИБКА проверки связи:", e.message);
+      }
+    }
     if (env.MQM_KV && tuyaReady(env)) {
       try {
         await runTimers(env, s);
