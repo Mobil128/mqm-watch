@@ -20,7 +20,7 @@
 // Cron Trigger в Cloudflare: "* * * * *" — воркер просыпается каждую минуту,
 // а как часто проверять экзамен, решает настройка на странице.
 //
-// Запуск ссылкой: /run?key=RUN_KEY&exam=1&weather=1&test=0&clean=0&dump=0
+// Запуск ссылкой: /run?key=RUN_KEY&exam=1&weather=1&test=0&dump=0
 
 const DEFAULT_URL = "https://kabinet.mqm.az/result/1505867/e40b3558-d105-4cc5-8752-594581ee467a";
 const DEFAULT_SUBJECTS = ["İngilis dili", "Azərbaycan dili", "Riyaziyyat"];
@@ -30,11 +30,6 @@ const COUNTERS = {
   unverified: /Qiymətləndirilməyib:\s*(\d+)/, // открытые вопросы на проверке
 };
 
-// Уборка трогает только свои исходящие сообщения с этими значками.
-const SCORE_PREFIX = "📊";
-const BOT_PREFIXES = [SCORE_PREFIX, "🌦", "✅ Test", "🔌", "📅", "📚"];
-// Бесплатный план Cloudflare: не больше 50 внешних запросов за запуск.
-const MAX_DELETES = 40;
 // Бесплатный план KV: 1000 записей в сутки; каждая проверка пишет лог запуска.
 const MIN_INTERVAL = 5;
 
@@ -68,7 +63,6 @@ function defaults(env) {
     lon: env.WEATHER_LON || "50.01",
     send_hour: parseInt(env.WEATHER_SEND_HOUR || "7", 10),
     hours: parseInt(env.WEATHER_HOURS || "24", 10),
-    clean_enabled: true,
     gemini_model: "gemini-flash-latest",
     gemini_lang: "ru",
     tuya_region: "eu",
@@ -79,13 +73,11 @@ function defaults(env) {
     camera_forward: false,
     camera_chat: "",
     camera_cooldown: 5,
-    cam_clean_enabled: true,
     cal_enabled: false,
     cal_urls: "",
     cal_holidays: "",
     cal_hour: 8,
     cal_tomorrow: true,
-    auto_delete: false,
     sched_enabled: false,
     sched_before: 0,
     sched_chat: "",
@@ -110,7 +102,6 @@ function config(env, s) {
     id: (env.GREEN_ID_INSTANCE || "").trim(),
     token: (env.GREEN_API_TOKEN || "").trim(),
     chat,
-    cleanCount: parseInt(env.CLEAN_HISTORY_COUNT || "200", 10),
     acted: false, // было ли реальное действие (для записи лога запуска)
     lines: [],
     log(...args) {
@@ -268,18 +259,13 @@ async function apiCall(c, method, payload) {
   });
   const raw = await res.text();
   if (res.status === 466 || raw.includes("QUOTE_EXCEEDED")) {
-    // месячный лимит тарифа: повторять удаления бессмысленно, пока не сменится месяц или тариф
-    if (c.kv) await c.kv.put("green_quota_until", String(Date.now() + 24 * 3600000), { expirationTtl: 86400 });
-    const e = new Error("Лимит Green API на этом тарифе исчерпан — удаление сообщений временно остановлено");
+    // лимит тарифа Green API исчерпан
+    const e = new Error("Лимит Green API на этом тарифе исчерпан");
     e.quota = true;
     throw e;
   }
   if (!res.ok) throw new Error(`Green API ${method} ${res.status}: ${raw}`);
   return raw ? JSON.parse(raw) : null;
-}
-
-async function quotaBlocked(c) {
-  return !!c.kv && Number(await c.kv.get("green_quota_until")) > Date.now();
 }
 
 // ---------------- Журнал обрывов связи с Green API ----------------
@@ -353,74 +339,6 @@ const bakuTime = (ms) => {
   const d = new Date(ms + BAKU_OFFSET_MS);
   return `${dm(d)} ${hm(d)}`;
 };
-
-// ---------------- Уборка старых сообщений бота ----------------
-
-// Удаляет у всех сообщения бота старше сегодняшних 00:00 (Баку).
-// Если сегодня не было сообщения с баллами — оставляет последнее более раннее.
-async function cleanupOld(c, dry) {
-  c.acted = true;
-  if (!dry && (await quotaBlocked(c))) {
-    c.log("Уборка старых сообщений пропущена: лимит Green API исчерпан, повтор через сутки");
-    return;
-  }
-  const now = bakuNow();
-  const cutoff = (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - BAKU_OFFSET_MS) / 1000;
-  const history = (await apiCall(c, "getChatHistory", { chatId: c.chat, count: c.cleanCount })) || [];
-  // сообщения, которые WhatsApp уже отказался удалять: не тратим на них лимит запросов
-  const skip = new Set((await c.kv.get("clean_skip", "json")) || []);
-
-  const mine = history
-    .filter((m) => m.type === "outgoing" && typeof m.textMessage === "string"
-      && BOT_PREFIXES.some((p) => m.textMessage.startsWith(p)))
-    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-
-  const old = mine.filter((m) => (m.timestamp || 0) < cutoff);
-  const scoreToday = mine.some((m) => m.textMessage.startsWith(SCORE_PREFIX) && (m.timestamp || 0) >= cutoff);
-  let keep = null;
-  if (!scoreToday) {
-    const oldScores = old.filter((m) => m.textMessage.startsWith(SCORE_PREFIX));
-    keep = oldScores.length ? oldScores[oldScores.length - 1] : null;
-  }
-  const pending = old.filter((m) => m !== keep && !skip.has(m.idMessage));
-  const todo = pending.slice(0, MAX_DELETES);
-
-  c.log(`История: ${history.length} сообщений, моих: ${mine.length}, к удалению: ${pending.length}`
-    + (keep ? `, оставляю: ${keep.idMessage}` : "")
-    + (pending.length > todo.length ? `, сейчас удалю ${todo.length}, остальные — в следующий раз` : ""));
-
-  let deleted = 0, gone = 0, failed = 0;
-  for (const m of todo) {
-    const label = `${bakuTime(m.timestamp * 1000)} «${m.textMessage.split("\n")[0].slice(0, 40)}»`;
-    if (dry) {
-      c.log(`  [пробный режим] удалил бы ${label}`);
-      continue;
-    }
-    try {
-      await apiCall(c, "deleteMessage", { chatId: c.chat, idMessage: m.idMessage, onlySenderDelete: false });
-      deleted++;
-      c.log(`  удалено ${label}`);
-    } catch (e) {
-      if (e.quota) {
-        c.log("Лимит Green API исчерпан — остальные сообщения не трогаю, повтор через сутки");
-        break;
-      }
-      if (String(e).includes("already was deleted")) {
-        gone++; // в истории ещё числится, но уже удалено — это нормально
-      } else {
-        failed++; // например, слишком старое: WhatsApp не даёт удалить у всех
-        skip.add(m.idMessage);
-        c.log(`  не удалось ${label}: ${e.message}`);
-      }
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  if (!dry) c.log(`Готово: удалено ${deleted}, уже было удалено ${gone}, не удалось ${failed}`);
-  if (failed) {
-    await c.kv.put("clean_skip", JSON.stringify([...skip].slice(-500)));
-    throw new Error(`Не удалось удалить ${failed} сообщ.`);
-  }
-}
 
 // ---------------- Прогноз погоды ----------------
 
@@ -505,8 +423,8 @@ function fmtWeather(c, h, now) {
   return lines.join("\n");
 }
 
-// Раз в сутки после часа отправки (по Баку): уборка старых сообщений, затем прогноз.
-// force=true — «прогноз сейчас»: уборка в пробном режиме, дата отправки не пишется.
+// Раз в сутки после часа отправки (по Баку): прогноз.
+// force=true — «прогноз сейчас»: дата отправки не пишется.
 async function dailyWeather(c, force) {
   const now = bakuNow();
   const today = ymd(now);
@@ -533,21 +451,9 @@ async function dailyWeather(c, force) {
 }
 
 async function sendForecast(c, force, now, today) {
-  let cleanError = null;
-  if (c.s.clean_enabled && c.s.auto_delete) {
-    try {
-      await cleanupOld(c, force);
-    } catch (e) { // сбой уборки не должен лишать прогноза
-      cleanError = e;
-      c.log("ОШИБКА уборки:", e.message);
-    }
-  } else {
-    c.log("Автоудаление выключено: вчерашние сообщения не удаляются");
-  }
   const tomorrow = ymd(addHours(now, 24));
   await send(c, fmtWeather(c, await fetchWeather(c, today, tomorrow), now));
   if (!force) await c.kv.put("weather_date", today);
-  if (cleanError) throw cleanError;
 }
 
 // ---------------- Календарь: дни рождения и праздники ----------------
@@ -658,13 +564,12 @@ async function dailyCalendar(c, force) {
 
 // ---------------- Расписание уроков ----------------
 // Уроки лежат в Firebase (/schedule/lessons/<id>), копия — в KV ("lessons_cache"), чтобы минутный cron не ходил в базу.
-// В начале урока (или за N минут) бот пишет в группу; сообщения об уроках за прошлые дни удаляются.
+// В начале урока (или за N минут) бот пишет в группу.
 
 const LESSON_DAYS = [[1, "Понедельник"], [2, "Вторник"], [3, "Среда"], [4, "Четверг"], [5, "Пятница"], [6, "Суббота"], [0, "Воскресенье"]];
 const LESSON_BEFORE = [0, 5, 10, 15, 30];
 const LESSON_DURATIONS = [30, 40, 45, 50, 60, 75, 90, 120];
 const LESSON_WINDOW_MIN = 5; // сколько минут после срока ещё можно отправить (если cron пропустил минуту)
-const LESSON_CLEAN_BATCH = 5;
 
 // Расписание из приложения расписания (shared.data): день 1 — понедельник … 6 — суббота, 0 — воскресенье.
 const LESSON_SEED = [
@@ -701,36 +606,7 @@ async function lessonsRefreshCache(env) {
 const lessonMessage = (l, before) =>
   `${before ? `📚 ${before} dəq sonra dərs: ${l.subject}` : `📚 Dərs başlayır: ${l.subject}`}\n🕒 ${l.time}–${lessonEnd(l)}`;
 
-async function rememberLessonMessage(env, chat, idMessage, time) {
-  if (!idMessage) return;
-  const list = (await env.MQM_KV.get("lesson_msgs", "json")) || [];
-  list.push({ id: idMessage, chat, time });
-  await env.MQM_KV.put("lesson_msgs", JSON.stringify(list.slice(-100)));
-}
-
-// Удаляет сообщения об уроках, отправленные до сегодняшней полуночи (по Баку), по нескольку за минуту.
-async function cleanLessonMessages(env, s, now) {
-  if (!s.auto_delete) return;
-  const list = (await env.MQM_KV.get("lesson_msgs", "json")) || [];
-  const cutoff = bakuAt(now, 0);
-  const batch = list.filter((m) => m.time < cutoff).slice(0, LESSON_CLEAN_BATCH);
-  if (!batch.length) return;
-  const c = config(env, s);
-  if (await quotaBlocked(c)) return; // сообщения остаются в очереди до восстановления лимита
-  for (const m of batch) {
-    try {
-      await apiCall(c, "deleteMessage", { chatId: m.chat, idMessage: m.id, onlySenderDelete: false });
-    } catch (e) {
-      if (e.quota) return;
-      if (!String(e.message).includes("already was deleted")) console.log("Сообщение об уроке не удалено:", e.message);
-    }
-  }
-  const done = new Set(batch.map((m) => m.id)); // что не удалилось (слишком старое) — тоже убираем из очереди
-  await env.MQM_KV.put("lesson_msgs", JSON.stringify(list.filter((m) => !done.has(m.id))));
-}
-
 async function runLessons(env, s, now = Date.now()) {
-  await cleanLessonMessages(env, s, now);
   if (!s.sched_enabled) return;
   const d = new Date(now + BAKU_OFFSET_MS);
   const day = d.getUTCDay();
@@ -744,9 +620,8 @@ async function runLessons(env, s, now = Date.now()) {
     const key = `lesson_${today}_${fbKey(l.id)}`;
     if (await env.MQM_KV.get(key)) continue;
     try {
-      const reply = await sendTo(env, s, s.sched_chat || null, lessonMessage(l, before));
+      await sendTo(env, s, s.sched_chat || null, lessonMessage(l, before));
       await env.MQM_KV.put(key, "1", { expirationTtl: 172800 });
-      await rememberLessonMessage(env, s.sched_chat || config(env, s).chat, reply?.idMessage, now);
       await env.MQM_KV.put("lesson_last", JSON.stringify({ time: now, ok: true, text: `${l.time} ${l.subject}` }));
     } catch (e) {
       await env.MQM_KV.put("lesson_last", JSON.stringify({ time: now, ok: false, text: `${l.time} ${l.subject}: ${e.message.slice(0, 120)}` }));
@@ -856,7 +731,7 @@ ${toggleForm("sched_enabled", s.sched_enabled, "Сообщение в групп
 <button class="btn">💾 Сохранить</button>
 </form>
 <p class="hint">Так выглядит сообщение:<br><code>${esc(lessonMessage(sample, s.sched_before || 0)).replace(/\n/g, "<br>")}</code></p>
-<p class="hint">Сообщения об уроках за прошлые дни бот удаляет сам после полуночи по Баку. ${lessonLast ? `Последнее сообщение: ${ago(lessonLast.time)} · ${lessonLast.ok ? `<span class="ok">отправлено</span>` : `<span class="bad">ошибка</span>`} (${esc(lessonLast.text)})` : ""}</p>
+<p class="hint">${lessonLast ? `Последнее сообщение: ${ago(lessonLast.time)} · ${lessonLast.ok ? `<span class="ok">отправлено</span>` : `<span class="bad">ошибка</span>`} (${esc(lessonLast.text)})` : ""}</p>
 ${lessonsErr ? `<p class="bad">Firebase: ${esc(lessonsErr)} — показана копия расписания.</p>` : ""}
 </section>`;
 
@@ -906,7 +781,6 @@ async function run(env, s, opts, source) {
   let ok = true;
   const steps = [];
   if (opts.dump) steps.push(["Экзамен", () => checkResults(c, opts)]);
-  else if (opts.clean) steps.push(["Уборка", () => cleanupOld(c, false)]);
   else {
     if (opts.exam) steps.push(["Экзамен", () => checkResults(c, opts)]);
     if (opts.weather) steps.push(["Погода", () => dailyWeather(c, opts.test)]);
@@ -2189,95 +2063,6 @@ async function sendCameraPhoto(env, s, chatId, caption, ev) {
   return raw ? JSON.parse(raw) : null;
 }
 
-// ---------------- Уборка старых тревог камеры ----------------
-// После CAM_CLEAN_HOUR по Баку первая тревога за день ставит в очередь все тревоги, отправленные раньше.
-// Cron удаляет из очереди по CAM_CLEAN_BATCH штук каждые CAM_CLEAN_EVERY мс.
-
-const CAM_CLEAN_HOUR = 5;
-const CAM_CLEAN_BATCH = 3;
-const CAM_CLEAN_EVERY = 3 * 60000;
-
-// Полночь/час по Баку в виде обычного времени (мс UTC).
-const bakuAt = (ms, hour) => {
-  const d = new Date(ms + BAKU_OFFSET_MS);
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour) - BAKU_OFFSET_MS;
-};
-
-async function rememberCameraMessage(env, chat, idMessage, time) {
-  if (!idMessage) return;
-  const list = (await env.MQM_KV.get("cam_msgs", "json")) || [];
-  list.push({ id: idMessage, chat, time });
-  await env.MQM_KV.put("cam_msgs", JSON.stringify(list.slice(-300)));
-}
-
-async function startCameraCleanup(env, s, now) {
-  if (!s.auto_delete || !s.cam_clean_enabled || now < bakuAt(now, CAM_CLEAN_HOUR)) return;
-  const day = ymd(new Date(now + BAKU_OFFSET_MS));
-  const state = await env.MQM_KV.get("cam_clean", "json");
-  if (state && state.day === day) return;
-  const cutoff = bakuAt(now, CAM_CLEAN_HOUR);
-  const list = (await env.MQM_KV.get("cam_msgs", "json")) || [];
-  const old = list.filter((m) => m.time < cutoff);
-  const keep = list.filter((m) => m.time >= cutoff);
-  await env.MQM_KV.put("cam_clean", JSON.stringify({ day, queue: old, nextAt: now, deleted: 0 }));
-  await env.MQM_KV.put("cam_msgs", JSON.stringify(keep));
-}
-
-async function runCameraCleanup(env, s, now = Date.now()) {
-  if (!s.auto_delete) return;
-  const state = await env.MQM_KV.get("cam_clean", "json");
-  if (!state || !state.queue?.length || now < state.nextAt) return;
-  const c = config(env, s);
-  if (await quotaBlocked(c)) return;
-  const batch = state.queue.slice(0, CAM_CLEAN_BATCH);
-  let deleted = state.deleted || 0;
-  for (const m of batch) {
-    try {
-      await apiCall(c, "deleteMessage", { chatId: m.chat, idMessage: m.id, onlySenderDelete: false });
-      deleted++;
-    } catch (e) {
-      if (e.quota) return;
-      // уже удалено — ок; старше 2 суток WhatsApp не даёт удалить — тоже пропускаем, чтобы очередь не застряла
-      if (!String(e.message).includes("already was deleted")) console.log("Тревога не удалена:", e.message);
-    }
-  }
-  await env.MQM_KV.put("cam_clean", JSON.stringify({
-    ...state,
-    queue: state.queue.slice(CAM_CLEAN_BATCH),
-    nextAt: now + CAM_CLEAN_EVERY - 30000, // запас, чтобы минутный cron не пропускал срок
-    deleted,
-  }));
-}
-
-// Ручная уборка: все тревоги камер (текст 🚨 и фото с подписью 🕒) старше сегодняшних 05:00 по Баку.
-// Работает по истории чата, поэтому видит и тревоги, отправленные до появления очереди.
-const CAM_PURGE_MAX = 40;
-async function purgeCameraAlerts(env, s) {
-  const c = config(env, s);
-  const chat = s.camera_chat || c.chat;
-  const cutoffSec = bakuAt(Date.now(), CAM_CLEAN_HOUR) / 1000;
-  const history = (await apiCall(c, "getChatHistory", { chatId: chat, count: 300 })) || [];
-  const isAlert = (m) => m.type === "outgoing" && (
-    (typeof m.textMessage === "string" && m.textMessage.startsWith("🚨"))
-    || (m.typeMessage === "imageMessage" && String(m.caption || "").startsWith("🕒")));
-  const old = history.filter((m) => isAlert(m) && (m.timestamp || 0) < cutoffSec)
-    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-  const todo = old.slice(0, CAM_PURGE_MAX);
-  let deleted = 0, gone = 0, failed = 0;
-  for (const m of todo) {
-    try {
-      await apiCall(c, "deleteMessage", { chatId: chat, idMessage: m.idMessage, onlySenderDelete: false });
-      deleted++;
-    } catch (e) {
-      if (e.quota) throw e;
-      if (String(e.message).includes("already was deleted")) gone++;
-      else { failed++; c.log(`не удалось: ${e.message.slice(0, 120)}`); }
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  return { found: old.length, deleted, gone, failed, left: old.length - todo.length };
-}
-
 async function cameraEvent(env, ev) {
   const s = await loadSettings(env);
   const now = Date.now();
@@ -2306,17 +2091,10 @@ async function cameraEvent(env, ev) {
           console.log("Снимок не отправлен, шлю текстом:", e.message);
         }
       }
-      let sent = null;
-      if (!sentPhoto) sent = await sendTo(env, s, s.camera_chat || null, caption);
-      else sent = photoReply;
+      if (!sentPhoto) await sendTo(env, s, s.camera_chat || null, caption);
       last[camera] = now;
       await env.MQM_KV.put("camera_last", JSON.stringify(last));
       forwarded = true;
-      const chatId = s.camera_chat || config(env, s).chat;
-      if (sent?.idMessage) {
-        await rememberCameraMessage(env, chatId, sent.idMessage, now);
-        await startCameraCleanup(env, s, now);
-      }
     }
   }
   if (firebaseReady(env)) {
@@ -2402,12 +2180,6 @@ function homeHouseCard(env, st) {
     return switchRows(dev, live.v, h.timers, "home");
   }).join("");
   return `<section class="card"><h2>🏠 Дом</h2>${h.tokenError ? `<p class="bad">${esc(h.tokenError)}</p>` : rows}<a class="btn" href="#house">Всё о доме</a></section>`;
-}
-
-function camCleanNote(cc) {
-  if (!cc || !cc.queue?.length) return cc?.day ? `<p class="hint">Уборка за ${cc.day}: удалено ${cc.deleted || 0}, очередь пуста.</p>` : "";
-  const mins = Math.max(0, Math.ceil((cc.nextAt + CAM_CLEAN_EVERY - Date.now()) / 60000));
-  return `<p class="hint">Уборка: удалено ${cc.deleted || 0}, осталось ${cc.queue.length} (по ${CAM_CLEAN_BATCH} раз в ${CAM_CLEAN_EVERY / 60000} мин, следующие примерно через ${mins} мин).</p>`;
 }
 
 function photoNote(e) {
@@ -2516,8 +2288,6 @@ ${c("!nəticə", "баллы экзамена")}${c("!hava", "прогноз п�
 </form>
 <section class="card">
 <h2>Последние тревоги</h2>
-${toggleForm("cam_clean_enabled", s.cam_clean_enabled, "Удалять старые тревоги из группы после 5 утра")}
-${camCleanNote(st.camClean)}
 ${h.camError ? `<p class="bad">${esc(h.camError)}</p>` : h.camEvents.length
     ? h.camEvents.map((e) => `<div class="row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small><br><small>${photoNote(e)}</small></span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("") + oldScriptHint(h.camEvents)
     : `<p class="meta">Пока не было.${firebaseReady(env) ? "" : " Список хранится в Firebase — он не настроен."}</p>`}
@@ -2932,7 +2702,6 @@ async function gatherStatus(env, origin) {
   const house = await houseStatus(env, s);
   const camToken = await cameraToken(env);
   const cameraUrl = camToken ? `${origin}/camera/${camToken}` : null;
-  const camClean = kv ? await kv.get("cam_clean", "json") : null;
   const rawHook = kv ? await kv.get("last_hook_raw", "json") : null;
   const connLog = kv ? (await kv.get("conn_log", "json")) || [] : [];
   // расписание: основное — Firebase; KV-копию подтягиваем под него, при сбое базы показываем копию
@@ -2950,7 +2719,7 @@ async function gatherStatus(env, origin) {
     photos.sentToday = (await kv.get("photo_date")) === ymd(bakuNow());
     photos.last = await kv.get("photo_last", "json");
   }
-  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, camClean, rawHook, connLog, lessons, lessonsErr: lessonsRaw.e || null, lessonLast, photos };
+  return { s, kv, last, state, weatherDate, calDate, lastHook, chats, chatList, gState, gSettings, hookWhere, orderList, house, cameraUrl, rawHook, connLog, lessons, lessonsErr: lessonsRaw.e || null, lessonLast, photos };
 }
 
 function problems(env, st) {
@@ -3164,8 +2933,6 @@ function settingsPanel(st) {
 <label>Время отправки<select name="send_hour">${Array.from({ length: 24 }, (_, h) => `<option value="${h}"${sel(h, s.send_hour)}>${pad(h)}:00</option>`).join("")}</select></label>
 <label>На сколько часов<select name="hours">${[6, 12, 18, 24].map((h) => `<option value="${h}"${sel(h, s.hours)}>${h} ч</option>`).join("")}${[6, 12, 18, 24].includes(s.hours) ? "" : `<option value="${s.hours}" selected>${s.hours} ч</option>`}</select></label>
 </div>
-<input type="hidden" name="clean_enabled" value="off">
-<label class="switch">Перед прогнозом удалять вчерашние сообщения бота<input type="checkbox" name="clean_enabled" value="on"${checked(s.clean_enabled)}></label>
 <details><summary>Дополнительно</summary><div class="adv grid2">
 <label>Широта<input type="text" inputmode="decimal" name="lat" value="${esc(s.lat)}"></label>
 <label>Долгота<input type="text" inputmode="decimal" name="lon" value="${esc(s.lon)}"></label>
@@ -3237,12 +3004,8 @@ ${actionButton("service", "webhook", "🔗 Подключить вебхук в 
 <section class="card">
 <h2>Действия</h2>
 <div class="btns">
-${toggleForm("auto_delete", s.auto_delete, "Автоудаление старых сообщений бота", "service")}
-<p class="hint">Выключено по умолчанию: вчерашние прогнозы, тревоги камер и сообщения об уроках бот не удаляет сам. Кнопки ниже работают всегда, но только по нажатию.</p>
 ${actionButton("service", "orders", "⛽ Найти заказы в собранных сообщениях")}
-${actionButton("service", "cam_purge", "🧹 Удалить старые тревоги камер (фото и текст)", { cls: "danger", confirmText: "Удалить из группы все тревоги камер, отправленные до сегодняшних 05:00? Удалить можно только то, что WhatsApp ещё разрешает." })}
 ${actionButton("service", "dump", "🔍 Что бот видит на странице экзамена")}
-${actionButton("service", "clean", "🧹 Удалить старые сообщения бота", { cls: "danger", confirmText: "Удалить у всех старые сообщения бота в группе?" })}
 ${actionButton("service", "reset", "↺ Сбросить сохранённые баллы", { cls: "danger", confirmText: "Сбросить сохранённые баллы? Следующая проверка запомнит текущие без сообщения." })}
 </div>
 </section>
@@ -3304,7 +3067,6 @@ async function saveSettings(request, env) {
     lon: coord("lon", 180, "Долгота"),
     send_hour: int("send_hour", 0, 23, "Время отправки"),
     hours: int("hours", 1, 24, "На сколько часов"),
-    clean_enabled: f.getAll("clean_enabled").includes("on"),
     gemini_model: model,
     gemini_lang: LANGS[lang] ? lang : old.gemini_lang,
     cal_urls: (() => {
@@ -3328,10 +3090,8 @@ const TOGGLES = {
   exam_enabled: ["Слежение за баллами включено", "Слежение за баллами выключено"],
   weather_enabled: ["Утренний прогноз включён", "Утренний прогноз выключен"],
   cal_enabled: ["Календарь включён", "Календарь выключен"],
-  cam_clean_enabled: ["Старые тревоги удаляются после 5 утра", "Старые тревоги не удаляются"],
   sched_enabled: ["Сообщения об уроках включены", "Сообщения об уроках выключены"],
   photo_enabled: ["Фото дня включено", "Фото дня выключено"],
-  auto_delete: ["Автоудаление включено: бот сам удаляет старые сообщения", "Автоудаление выключено: бот ничего не удаляет сам"],
 };
 
 async function toggleSetting(f, env) {
@@ -3348,36 +3108,21 @@ const ACTION_SUMMARY = {
   weather: "прогноз отправлен в группу",
   calendar: "см. подробности: что ушло в группу",
   dump: "ниже текст страницы экзамена и что из него понял бот",
-  clean: "старые сообщения бота удалены",
 };
 
 async function doAction(env, action, origin) {
   const s = await loadSettings(env);
-  const base = { exam: false, weather: false, calendar: false, test: false, clean: false, dump: false };
+  const base = { exam: false, weather: false, calendar: false, test: false, dump: false };
   const opts = {
     exam: { exam: true },
     test: { exam: true, test: true },
     weather: { weather: true, test: true },
     calendar: { calendar: true, test: true },
     dump: { dump: true },
-    clean: { clean: true },
   }[action];
   if (action === "webhook") {
     try {
       return { ok: true, summary: "адрес прописан, Green API может пару минут перезапускаться", log: await connectWebhook(env, origin) };
-    } catch (e) {
-      return { ok: false, summary: e.message };
-    }
-  }
-  if (action === "cam_purge") {
-    try {
-      const r = await purgeCameraAlerts(env, s);
-      if (!r.found) return { ok: true, summary: "старых тревог камер в истории чата не нашлось" };
-      const parts = [`удалено ${r.deleted}`];
-      if (r.gone) parts.push(`уже не было: ${r.gone}`);
-      if (r.failed) parts.push(`WhatsApp не дал удалить: ${r.failed}`);
-      if (r.left) parts.push(`осталось ${r.left} — нажмите ещё раз`);
-      return { ok: true, summary: parts.join(", "), log: r.failed ? "Часть тревог старше нескольких суток: WhatsApp не удаляет такие сообщения." : undefined, open: r.failed > 0 };
     } catch (e) {
       return { ok: false, summary: e.message };
     }
@@ -3442,11 +3187,6 @@ export default {
       } catch (e) {
         console.log("ОШИБКА фото дня:", e.message);
       }
-      try {
-        await runCameraCleanup(env, s);
-      } catch (e) {
-        console.log("ОШИБКА уборки тревог:", e.message);
-      }
     }
     if (!s.enabled) return;
     const tick = Math.floor(event.scheduledTime / 60000);
@@ -3454,7 +3194,7 @@ export default {
       exam: s.exam_enabled && tick % s.interval === 0,
       weather: s.weather_enabled,
       calendar: s.cal_enabled,
-      test: false, clean: false, dump: false,
+      test: false, dump: false,
     }, "по расписанию");
     if (!res.ok) throw new Error(res.log);
   },
@@ -3472,7 +3212,6 @@ export default {
         exam: flag(p, "exam", true),
         weather: flag(p, "weather", true),
         test: flag(p, "test", false),
-        clean: flag(p, "clean", false),
         dump: flag(p, "dump", false),
       }, "по ссылке");
       return new Response((res.ok ? "OK\n\n" : "ОШИБКА\n\n") + res.log, {
