@@ -72,7 +72,8 @@ function defaults(env) {
     tuya_wa_reply: true,
     camera_forward: false,
     camera_chat: "",
-    camera_cooldown: 5,
+    camera_cooldown: 0.5, // минут; 0.5 = 30 секунд
+    camera_skip_end: true, // камера шлёт два письма на одно срабатывание: «Старт» и «Конец» — «Конец» пропускаем
     cal_enabled: false,
     cal_urls: "",
     cal_holidays: "",
@@ -2023,7 +2024,8 @@ ${items ? `<ol class="photos">${items}</ol>` : `<p class="meta">Очередь �
 // ---------------- Дом: тревоги камер ----------------
 // Адрес /camera/<ключ>: ключ выводится из WEBHOOK_SECRET, отдельный секрет не нужен.
 
-const CAMERA_COOLDOWNS = [0, 1, 5, 15, 30, 60];
+const CAMERA_COOLDOWNS = [0, 0.5, 1, 5, 15, 30, 60]; // минуты; 0.5 = 30 секунд
+const cooldownLabel = (m) => (!m ? "без паузы" : m < 1 ? `раз в ${Math.round(m * 60)} сек на камеру` : `раз в ${m} мин на камеру`);
 const cameraToken = async (env) => (env.WEBHOOK_SECRET ? (await sha256Hex("camera:" + env.WEBHOOK_SECRET)).slice(0, 24) : null);
 
 // Снимок из письма камеры: base64 из сценария Gmail → файл в WhatsApp с текстом тревоги в подписи.
@@ -2079,6 +2081,16 @@ async function cameraEvent(env, ev) {
   const camera = String(ev.camera || ev.app || "Kamera").replace(/\s+/g, " ").trim().slice(0, 80) || "Kamera";
   const text = [ev.title, ev.text].filter((x) => x && String(x).trim()).map(String).join(" — ").replace(/\s+/g, " ").trim().slice(0, 500);
   let forwarded = false, reason = "";
+  // Камера шлёт два письма на одно срабатывание («Старт» и «Конец»). «Конец» пропускаем целиком: ни в приложении, ни в WhatsApp.
+  if (!ev.test && s.camera_skip_end && /Конец|\b(?:stop|end)\b/i.test(text)) {
+    return { forwarded: false, reason: "сообщение «Конец» пропущено", photo: "", skipped: true };
+  }
+  // Пауза между тревогами одной камеры действует и на приложение, и на WhatsApp. Время последней тревоги пишем в конце,
+  // после успешной обработки: если отправка упадёт, повторное письмо пройдёт, а не попадёт в паузу.
+  const lastAlarm = (await env.MQM_KV.get("camera_last", "json")) || {};
+  if (!ev.test && s.camera_cooldown && now - (lastAlarm[camera] || 0) < s.camera_cooldown * 60000) {
+    return { forwarded: false, reason: "пауза между тревогами этой камеры", photo: "", skipped: true };
+  }
   // состояние снимка: "" — о снимках ничего не известно (старый скрипт или другой источник), noimage — в письме снимка нет,
   // received — получен, но не пересылался, sent — ушёл в WhatsApp, failed — отправить не удалось (текст всё равно ушёл)
   let photo = ev.image ? "received" : String(ev.script || "") === "2" ? "noimage" : "";
@@ -2089,9 +2101,7 @@ async function cameraEvent(env, ev) {
   }
   if (!s.camera_forward) reason = "пересылка в WhatsApp выключена";
   else {
-    const last = (await env.MQM_KV.get("camera_last", "json")) || {};
-    if (s.camera_cooldown && now - (last[camera] || 0) < s.camera_cooldown * 60000) reason = "пауза между тревогами этой камеры";
-    else {
+    {
       const caption = `🚨 ${camera}${text ? `\n${text}` : ""}\n🕒 ${bakuTime(now)}`;
       let sentPhoto = false, photoReply = null;
       if (ev.image) {
@@ -2107,8 +2117,6 @@ async function cameraEvent(env, ev) {
         }
       }
       if (!sentPhoto) await sendTo(env, s, s.camera_chat || null, caption);
-      last[camera] = now;
-      await env.MQM_KV.put("camera_last", JSON.stringify(last));
       forwarded = true;
     }
   }
@@ -2126,6 +2134,10 @@ async function cameraEvent(env, ev) {
   if (firebaseReady(env)) {
     await firebase(env, "PATCH", "/", { [`camera_events/${now}_${Math.random().toString(36).slice(2, 8)}`]: { time: now, camera, text, forwarded, photo, photoError: photoError || null, image } })
       .catch((e) => console.log("Тревога не сохранена:", e.message));
+  }
+  if (!ev.test) {
+    lastAlarm[camera] = now;
+    await env.MQM_KV.put("camera_last", JSON.stringify(lastAlarm));
   }
   return { forwarded, reason, photo, ...(photoError ? { photoError } : {}) };
 }
@@ -2326,7 +2338,9 @@ ${c("!nəticə", "баллы экзамена")}${c("!hava", "прогноз п�
 <input type="hidden" name="camera_forward" value="off">
 <label class="switch">Пересылать тревоги в WhatsApp<input type="checkbox" name="camera_forward" value="on"${checked(s.camera_forward)}></label>
 <label>Куда<select name="camera_chat"><option value=""${sel("", s.camera_chat)}>Основная группа бота</option>${chats}</select></label>
-<label>Не чаще чем<select name="camera_cooldown">${CAMERA_COOLDOWNS.map((m) => `<option value="${m}"${sel(m, s.camera_cooldown)}>${m ? `раз в ${m} мин на камеру` : "без паузы"}</option>`).join("")}</select></label>
+<label>Не чаще чем<select name="camera_cooldown">${CAMERA_COOLDOWNS.map((m) => `<option value="${m}"${sel(m, s.camera_cooldown)}>${cooldownLabel(m)}</option>`).join("")}</select></label>
+<input type="hidden" name="camera_skip_end" value="off">
+<label class="switch">Не показывать сообщения «Конец» (камера шлёт «Старт» и «Конец» на одно срабатывание)<input type="checkbox" name="camera_skip_end" value="on"${checked(s.camera_skip_end)}></label>
 <button class="btn">💾 Сохранить</button>
 </form>
 <section class="card">
@@ -2462,11 +2476,11 @@ async function houseAction(env, form) {
     const cooldown = Number(str("camera_cooldown"));
     if (!CAMERA_COOLDOWNS.includes(cooldown)) throw new Error("Неверная пауза");
     if (chat && !/^[\w.-]+@(g|c)\.us$/.test(chat)) throw new Error("Неверный чат");
-    await save({ camera_forward: on("camera_forward"), camera_chat: chat, camera_cooldown: cooldown });
+    await save({ camera_forward: on("camera_forward"), camera_chat: chat, camera_cooldown: cooldown, camera_skip_end: on("camera_skip_end") });
     return on("camera_forward") ? "Тревоги будут приходить в WhatsApp" : "Пересылка тревог выключена";
   }
   if (action === "camera_test") {
-    const r = await cameraEvent(env, { camera: "Test", text: "Sınaq həyəcan siqnalı" });
+    const r = await cameraEvent(env, { camera: "Test", text: "Sınaq həyəcan siqnalı", test: true });
     return r.forwarded ? "Тестовая тревога отправлена в WhatsApp" : `Тестовая тревога записана (${r.reason})`;
   }
   throw new Error("Неизвестное действие");
