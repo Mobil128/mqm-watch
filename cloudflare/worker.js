@@ -2038,6 +2038,8 @@ function sniffImage(b) {
   return null;
 }
 
+const CAMERA_LIST_HOURS = 24; // за сколько часов показывать тревоги в приложении (ключи событий начинаются с времени, поэтому startAt по ключу)
+const CAMERA_LIST_MAX = 200;  // предохранитель: не больше стольких тревог за раз
 const CAMERA_IMAGE_TTL = 3 * 86400; // сколько секунд снимок тревоги живёт в KV и виден в приложении
 
 // Снимок из письма: base64 → байты, проверка размера и формата. Декодируем один раз на тревогу (лимит CPU на бесплатном плане).
@@ -2173,7 +2175,7 @@ async function houseStatus(env, s) {
     kv ? kv.get("tuya_timers", "json") : null,
     kv ? kv.get("tuya_events", "json") : null,
     tuyaReady(env) && devs.length && !tokenError ? Promise.all(devs.map((d) => safe(tuyaDevice(env, s, d.id)))) : [],
-    firebaseReady(env) ? safe(firebase(env, "GET", "/camera_events", null, `orderBy=${encodeURIComponent('"$key"')}&limitToLast=10`)) : { v: null },
+    firebaseReady(env) ? safe(firebase(env, "GET", "/camera_events", null, `orderBy=${encodeURIComponent('"$key"')}&startAt=${encodeURIComponent(`"${Date.now() - CAMERA_LIST_HOURS * 3600000}"`)}&limitToLast=${CAMERA_LIST_MAX}`)) : { v: null },
   ]);
   const camEvents = cams.v ? Object.values(cams.v).sort((a, b) => b.time - a.time) : [];
   return { devs, tokenError, timers: timers || [], events: events || [], live, camEvents, camError: cams.e };
@@ -2204,6 +2206,23 @@ function homeHouseCard(env, st) {
     return switchRows(dev, live.v, h.timers, "home");
   }).join("");
   return `<section class="card"><h2>🏠 Дом</h2>${h.tokenError ? `<p class="bad">${esc(h.tokenError)}</p>` : rows}<a class="btn" href="#house">Всё о доме</a></section>`;
+}
+
+function camStamp(ms) {
+  const d = new Date(ms + BAKU_OFFSET_MS);
+  return { date: `${pad(d.getUTCDate())}.${pad(d.getUTCMonth() + 1)}.${d.getUTCFullYear()}`, time: hm(d) };
+}
+
+function camEventHtml(e) {
+  const t = camStamp(e.time);
+  const src = e.image ? `/photo?k=${encodeURIComponent(e.image)}` : "";
+  const fwd = e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки";
+  return `<details class="cam-ev"><summary>`
+    + `<span class="cam-thumb">${src ? `<img loading="lazy" alt="" src="${src}">` : "📷"}</span>`
+    + `<span class="cam-info"><b>${t.time}</b><small>${t.date}</small><small>${esc(e.camera)}</small></span>`
+    + `<span class="cam-fwd">${fwd}</span></summary>`
+    + `<div class="cam-body">${src ? `<img loading="lazy" alt="Снимок тревоги" src="${src}">` : ""}`
+    + `<small>${esc(e.text || "")}</small><small>${photoNote(e) || "снимка нет"}</small></div></details>`;
 }
 
 function photoNote(e) {
@@ -2311,10 +2330,10 @@ ${c("!nəticə", "баллы экзамена")}${c("!hava", "прогноз п�
 <button class="btn">💾 Сохранить</button>
 </form>
 <section class="card">
-<h2>Последние тревоги</h2>
+<h2>Тревоги за последние ${CAMERA_LIST_HOURS} ч${h.camEvents.length ? ` · ${h.camEvents.length}${h.camEvents.length >= CAMERA_LIST_MAX ? "+" : ""}` : ""}</h2>
 ${h.camError ? `<p class="bad">${esc(h.camError)}</p>` : h.camEvents.length
-    ? h.camEvents.map((e) => `<div class="row cam-row"><span>${esc(e.camera)}<br><small>${esc(e.text || "")}</small><br><small>${photoNote(e)}</small>${e.image ? `<a href="/photo?k=${encodeURIComponent(e.image)}" target="_blank"><img class="cam-img" loading="lazy" alt="Снимок тревоги" src="/photo?k=${encodeURIComponent(e.image)}"></a>` : ""}</span><span>${bakuTime(e.time)}<br><small>${e.forwarded ? `<span class="ok">в WhatsApp</span>` : "без пересылки"}</small></span></div>`).join("") + oldScriptHint(h.camEvents)
-    : `<p class="meta">Пока не было.${firebaseReady(env) ? "" : " Список хранится в Firebase — он не настроен."}</p>`}
+    ? h.camEvents.map(camEventHtml).join("") + oldScriptHint(h.camEvents)
+    : `<p class="meta">За последние ${CAMERA_LIST_HOURS} ч тревог не было.${firebaseReady(env) ? "" : " Список хранится в Firebase — он не настроен."}</p>`}
 <form method="post" action="/house"><input type="hidden" name="do" value="camera_test"><button class="btn" data-confirm="Отправить тестовую тревогу${s.camera_forward ? " в WhatsApp" : ""}?">🧪 Тестовая тревога</button></form>
 </section>
 <details class="card"><summary>Как подключить камеры</summary>
@@ -2501,9 +2520,18 @@ main{max-width:640px;margin:0 auto;padding:12px 16px 24px;display:grid;gap:12px}
 .row:first-of-type{border-top:0}
 .row>span:first-child{color:var(--mut)}
 .row>span:last-child{text-align:right;word-break:break-word}
-.cam-row>span:first-child{min-width:0;flex:1;overflow-wrap:anywhere}
-.cam-row>span:last-child{flex:none;white-space:nowrap}
-.cam-img{display:block;max-width:100%;max-height:260px;margin-top:8px;border-radius:10px}
+.cam-ev{border-top:1px solid var(--line)}
+.cam-ev>summary{list-style:none;display:flex;align-items:center;gap:12px;padding:10px 0;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.cam-ev>summary::-webkit-details-marker{display:none}
+.cam-thumb{flex:none;width:72px;height:72px;border-radius:12px;overflow:hidden;background:var(--line);display:flex;align-items:center;justify-content:center;font-size:24px;color:var(--mut)}
+.cam-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.cam-info{min-width:0;flex:1;line-height:1.35}
+.cam-info b{font-size:20px}
+.cam-info small{display:block;color:var(--mut);overflow-wrap:anywhere}
+.cam-fwd{flex:none;text-align:right;font-size:13px;color:var(--mut)}
+.cam-body{padding:0 0 12px}
+.cam-body img{display:block;width:100%;border-radius:12px;margin-bottom:8px}
+.cam-body small{display:block;color:var(--mut);overflow-wrap:anywhere}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
 label{display:grid;gap:4px;font-size:14px;color:var(--mut)}
 input[type=text],input[type=url],input[type=password],select,textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit;font-size:16px}
